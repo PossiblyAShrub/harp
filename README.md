@@ -1,7 +1,47 @@
 # Harp
 
 Harp is an instrument for *quality* engineering, that happens to involve AI
-agents.
+agents. This means that the software engineer still is in command of how their
+system behaves. The goal is to leverage advanced engineering capabilities
+without removing the user from the loop.
+
+## What is Harp
+
+## Scopes
+
+Harp focuses on ensuring the engineer is kept up to date the properties of
+their system in the most useful way possible. In order to do this, we need to
+set the scope of what is to be viewed by the user.
+
+Scopes may be nested, and may have multiple projections. For example, a small
+CLI tool will likely have the scope of just a view of the projects source code,
+tests and documentation. But it could be more complex. A large company software
+system may have a scope of the whole system interacting, containing scopes for
+each web server codebase, application code. Some apps may want to be viewed
+independently, or some scopes may want to contain multiple components so they
+can be reasoned about.
+
+Scopes are not meant to be all-encompassing, however. It is still important to
+ensure the system stays a collection of files on a file system. We do not want
+to re-engineer the whole operating system. Just the interface in which the
+engineer sees the code.
+
+## Projections
+
+Scopes are a collection of projections. A projection is the output of an
+application (eg. neovim in a directory, an issues list for a repo, a file tree,
+etc.).
+
+A scope is not just the sum of it's projection. Instead, scopes come annotated
+with metadata about: where each projection runs, how to run each projection and
+how to organize those projections.
+
+Projections exist to provide the engineer with information about a scope. For
+example, in a RL project, an agent may create a projection for a user to
+visualize the environment and how a learned policy interacts with the
+environment.
+
+## The Why
 
 LLM-powered systems are invariably capable of the autonomous reasoning skills
 required to solve a significant number of software problems. This means that
