@@ -103,6 +103,14 @@ impl Projection {
         }
     }
 
+    fn set_error(&mut self, error: Option<String>) {
+        match self {
+            Projection::Term(_) => {}
+            Projection::Status(status) => status.set_error(error),
+            Projection::Scope(scope) => scope.set_error(error),
+        }
+    }
+
     fn is_interactive(&self) -> bool {
         match self {
             Projection::Term(_) => true,
@@ -225,6 +233,17 @@ impl TileNode {
             TileNode::Split { children, .. } => {
                 for child in children {
                     child.node.set_mode(mode);
+                }
+            }
+        }
+    }
+
+    fn set_error(&mut self, error: Option<String>) {
+        match self {
+            TileNode::Leaf { projection, .. } => projection.set_error(error),
+            TileNode::Split { children, .. } => {
+                for child in children {
+                    child.node.set_error(error.clone());
                 }
             }
         }
@@ -451,6 +470,12 @@ impl Scope {
     pub fn set_mode(&mut self, mode: Mode) {
         if let Some(root) = &mut self.root {
             root.set_mode(mode);
+        }
+    }
+
+    pub fn set_error(&mut self, error: Option<String>) {
+        if let Some(root) = &mut self.root {
+            root.set_error(error);
         }
     }
 

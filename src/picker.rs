@@ -6,7 +6,7 @@ use ratatui::{
     prelude::Buffer,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, Paragraph, Widget},
+    widgets::{Block, Clear, List, ListItem, Paragraph, Widget, Wrap},
 };
 
 use crate::{
@@ -37,6 +37,7 @@ pub struct ScopePicker {
     selected_program: usize,
     cwd: String,
     cursor: usize,
+    error: Option<String>,
 }
 
 impl ScopePicker {
@@ -59,7 +60,12 @@ impl ScopePicker {
             selected_program: 0,
             cwd,
             cursor,
+            error: None,
         }
+    }
+
+    pub fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
     }
 
     pub fn spec(&self) -> ScopeSpec {
@@ -84,6 +90,10 @@ impl ScopePicker {
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PickerAction {
         if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return PickerAction::None;
+        }
+
+        if key_event.code != KeyCode::Enter {
+            self.error = None;
         }
 
         match key_event.code {
@@ -162,7 +172,8 @@ impl ScopePicker {
 impl Widget for &ScopePicker {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let list_rows = self.programs.len().max(1) as u16 + 2;
-        let desired_height = 1 + list_rows + 3 + 1 + 2;
+        let error_rows = if self.error.is_some() { 2 } else { 0 };
+        let desired_height = 1 + list_rows + 3 + error_rows + 1 + 2;
         let popup_width = area.width.saturating_sub(4).min(64).max(24);
         let popup_height = area.height.saturating_sub(2).min(desired_height).max(9);
         let popup = centered_rect(popup_width, popup_height, area);
@@ -185,6 +196,7 @@ impl Widget for &ScopePicker {
                 Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(3),
+                Constraint::Length(error_rows),
                 Constraint::Length(1),
             ],
         )
@@ -258,11 +270,20 @@ impl Widget for &ScopePicker {
             Paragraph::new(self.cwd.as_str()).render(cwd_inner, buf);
         }
 
+        if let Some(err) = &self.error {
+            Paragraph::new(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Red),
+            ))
+            .wrap(Wrap { trim: true })
+            .render(chunks[3], buf);
+        }
+
         Paragraph::new(Span::styled(
             "Tab: field | Up/Down: select | Enter: launch | Esc: cancel",
             Style::default().fg(Color::DarkGray),
         ))
-        .render(chunks[3], buf);
+        .render(chunks[4], buf);
     }
 }
 

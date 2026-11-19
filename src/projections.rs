@@ -33,20 +33,40 @@ pub enum Mode {
 
 pub struct ProjectionStatus {
     mode: Mode,
+    error: Option<String>,
 }
 
 impl ProjectionStatus {
     pub fn new(mode: Mode) -> Self {
-        Self { mode }
+        Self { mode, error: None }
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
     }
+
+    pub fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
+    }
 }
 
 impl Widget for &ProjectionStatus {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if let Some(err) = &self.error {
+            let line = Line::from(vec![
+                Span::styled(
+                    " ERROR ",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {err}"), Style::default().fg(Color::Red)),
+            ]);
+            Paragraph::new(line).render(area, buf);
+            return;
+        }
+
         let (badge, badge_style, hint) = match self.mode {
             Mode::Interacting => (
                 " INTERACTING ",

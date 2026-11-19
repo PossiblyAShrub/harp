@@ -90,10 +90,15 @@ impl App {
                             self.picker = None;
                         }
                         PickerAction::Confirm { direction, spec } => {
-                            self.picker = None;
-                            self.scope
-                                .split_focused_with_spec(direction, &spec)
-                                .map_err(io::Error::other)?;
+                            match self.scope.split_focused_with_spec(direction, &spec) {
+                                Ok(()) => {
+                                    self.picker = None;
+                                    self.scope.set_error(None);
+                                }
+                                Err(err) => {
+                                    picker.set_error(Some(format!("Failed to launch: {err}")));
+                                }
+                            }
                         }
                     },
                     Event::Resize(_, _) => self.scope.handle_event(&event)?,
@@ -125,24 +130,34 @@ impl App {
                                     .modifiers
                                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                             {
+                                self.scope.set_error(None);
                                 self.set_mode(Mode::Interacting);
                             } else if let Some(dir) = arrow_direction(key_event.code) {
                                 if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                                    self.scope.set_error(None);
                                     self.picker = Some(ScopePicker::new(
                                         dir,
                                         self.default_cwd.clone(),
                                     ));
                                 } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
                                     let spec = ScopeSpec::default_zsh(self.default_cwd.clone());
-                                    self.scope
-                                        .split_focused_with_spec(dir, &spec)
-                                        .map_err(io::Error::other)?;
+                                    if let Err(err) =
+                                        self.scope.split_focused_with_spec(dir, &spec)
+                                    {
+                                        self.scope.set_error(Some(format!(
+                                            "Failed to launch: {err}"
+                                        )));
+                                    } else {
+                                        self.scope.set_error(None);
+                                    }
                                 } else {
+                                    self.scope.set_error(None);
                                     self.scope
                                         .handle_managing_key(*key_event)
                                         .map_err(io::Error::other)?;
                                 }
                             } else {
+                                self.scope.set_error(None);
                                 self.scope
                                     .handle_managing_key(*key_event)
                                     .map_err(io::Error::other)?;
