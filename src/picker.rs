@@ -228,7 +228,7 @@ impl Widget for &ScopePicker {
                     Style::default()
                 };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{prefix}{} ({})", opt.label, opt.program),
+                    format!("{prefix}{} ({})", opt.label, opt.display),
                     style,
                 )))
             })

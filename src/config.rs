@@ -1,29 +1,32 @@
 use std::{
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramOption {
     pub label: String,
     pub program: String,
+    pub display: String,
+}
+
+impl ProgramOption {
+    pub fn new(label: impl Into<String>, program: impl Into<String>) -> Self {
+        let program = program.into();
+        Self {
+            label: label.into(),
+            display: program.clone(),
+            program,
+        }
+    }
 }
 
 pub fn default_programs() -> Vec<ProgramOption> {
     vec![
-        ProgramOption {
-            label: "ZSH".to_string(),
-            program: "zsh".to_string(),
-        },
-        ProgramOption {
-            label: "Neovim".to_string(),
-            program: "/home/aolse/.asdf/shims/nvim".to_string(),
-        },
-        ProgramOption {
-            label: "lazygit".to_string(),
-            program: "lazygit".to_string(),
-        },
+        ProgramOption::new("ZSH", "zsh"),
+        ProgramOption::new("Neovim", "/home/aolse/.asdf/shims/nvim"),
+        ProgramOption::new("lazygit", "lazygit"),
     ]
 }
 
@@ -50,10 +53,7 @@ pub fn parse_harp_file(contents: &str) -> Vec<ProgramOption> {
         };
 
         if !label.is_empty() && !program.is_empty() {
-            programs.push(ProgramOption {
-                label: label.to_string(),
-                program: program.to_string(),
-            });
+            programs.push(ProgramOption::new(label, program));
         }
     }
 
@@ -68,6 +68,33 @@ fn strip_quotes(s: &str) -> &str {
     } else {
         s
     }
+}
+
+fn resolve_program(program: &str, base_dir: &Path) -> String {
+    let path = Path::new(program);
+    if path.is_absolute() || !program.contains('/') {
+        program.to_string()
+    } else {
+        normalize_path(&base_dir.join(path))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            _ => out.push(component),
+        }
+    }
+    out
 }
 
 pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption> {
@@ -95,8 +122,10 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
     let mut result = Vec::new();
 
     for file in files {
+        let base_dir = file.parent().unwrap_or_else(|| Path::new("/"));
         if let Ok(contents) = fs::read_to_string(&file) {
-            for opt in parse_harp_file(&contents) {
+            for mut opt in parse_harp_file(&contents) {
+                opt.program = resolve_program(&opt.program, base_dir);
                 if seen.insert(opt.label.clone()) {
                     result.push(opt);
                 }
@@ -141,22 +170,10 @@ mod tests {
         assert_eq!(
             parsed,
             vec![
-                ProgramOption {
-                    label: "ZSH".to_string(),
-                    program: "zsh".to_string(),
-                },
-                ProgramOption {
-                    label: "Neovim".to_string(),
-                    program: "/home/aolse/.asdf/shims/nvim".to_string(),
-                },
-                ProgramOption {
-                    label: "lazygit".to_string(),
-                    program: "lazygit".to_string(),
-                },
-                ProgramOption {
-                    label: "htop".to_string(),
-                    program: "htop".to_string(),
-                },
+                ProgramOption::new("ZSH", "zsh"),
+                ProgramOption::new("Neovim", "/home/aolse/.asdf/shims/nvim"),
+                ProgramOption::new("lazygit", "lazygit"),
+                ProgramOption::new("htop", "htop"),
             ]
         );
     }
@@ -181,18 +198,9 @@ mod tests {
         assert_eq!(
             loaded,
             vec![
-                ProgramOption {
-                    label: "Editor".to_string(),
-                    program: "/home/aolse/.asdf/shims/nvim".to_string(),
-                },
-                ProgramOption {
-                    label: "Shell".to_string(),
-                    program: "bash".to_string(),
-                },
-                ProgramOption {
-                    label: "Git".to_string(),
-                    program: "lazygit".to_string(),
-                },
+                ProgramOption::new("Editor", "/home/aolse/.asdf/shims/nvim"),
+                ProgramOption::new("Shell", "bash"),
+                ProgramOption::new("Git", "lazygit"),
             ]
         );
 
@@ -204,6 +212,40 @@ mod tests {
         let root = temp_dir("empty");
         let loaded = load_programs(&root, Some(&root.join("missing")));
         assert_eq!(loaded, default_programs());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_relative_paths_against_harp_file_directory() {
+        let root = temp_dir("relative");
+        let sub = root.join("nested").join("dir");
+        fs::create_dir_all(&sub).unwrap();
+
+        fs::write(
+            root.join(".harp"),
+            "Test = ./test.ysh\nSub = scripts/run.sh\nShell = zsh\nAbs = /usr/bin/env\n",
+        )
+        .unwrap();
+
+        let loaded = load_programs(&sub, None);
+        assert_eq!(
+            loaded,
+            vec![
+                ProgramOption {
+                    label: "Test".to_string(),
+                    program: root.join("test.ysh").to_string_lossy().into_owned(),
+                    display: "./test.ysh".to_string(),
+                },
+                ProgramOption {
+                    label: "Sub".to_string(),
+                    program: root.join("scripts/run.sh").to_string_lossy().into_owned(),
+                    display: "scripts/run.sh".to_string(),
+                },
+                ProgramOption::new("Shell", "zsh"),
+                ProgramOption::new("Abs", "/usr/bin/env"),
+            ]
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 }
