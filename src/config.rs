@@ -25,7 +25,7 @@ impl ProgramOption {
 pub fn default_programs() -> Vec<ProgramOption> {
     vec![
         ProgramOption::new("ZSH", "zsh"),
-        ProgramOption::new("Neovim", "/home/aolse/.asdf/shims/nvim"),
+        ProgramOption::new("Neovim", "nvim"),
         ProgramOption::new("lazygit", "lazygit"),
     ]
 }
