@@ -2,10 +2,11 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -82,7 +83,7 @@ impl Widget for &ProjectionStatus {
                     .fg(Color::Black)
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-                " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Ctrl+Shift+Arrows: custom",
+                " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | s: scopes | q: detach",
             ),
         };
 
@@ -100,6 +101,8 @@ pub struct ProjectionTerm {
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     exited: Arc<AtomicBool>,
+    revision: Arc<AtomicU64>,
+    notify: Arc<(Mutex<u64>, Condvar)>,
     size: (u16, u16),
 }
 
@@ -130,11 +133,15 @@ impl ProjectionTerm {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
         let exited = Arc::new(AtomicBool::new(false));
+        let revision = Arc::new(AtomicU64::new(1));
+        let notify = Arc::new((Mutex::new(0u64), Condvar::new()));
 
         let mut reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
         let parser_clone = Arc::clone(&parser);
         let exited_clone = Arc::clone(&exited);
+        let revision_clone = Arc::clone(&revision);
+        let notify_clone = Arc::clone(&notify);
 
         thread::spawn(move || {
             let mut buffer = [0u8; 4096];
@@ -145,10 +152,20 @@ impl ProjectionTerm {
                 }
 
                 parser_clone.lock().unwrap().process(&buffer[..n]);
+                revision_clone.fetch_add(1, Ordering::Release);
+                let (lock, cvar) = &*notify_clone;
+                let mut seq = lock.lock().unwrap();
+                *seq = seq.wrapping_add(1);
+                cvar.notify_all();
             }
 
             let _ = child.wait();
             exited_clone.store(true, Ordering::Release);
+            revision_clone.fetch_add(1, Ordering::Release);
+            let (lock, cvar) = &*notify_clone;
+            let mut seq = lock.lock().unwrap();
+            *seq = seq.wrapping_add(1);
+            cvar.notify_all();
         });
 
         Ok(Self {
@@ -156,12 +173,24 @@ impl ProjectionTerm {
             writer,
             parser,
             exited,
+            revision,
+            notify,
             size: (cols, rows),
         })
     }
 
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub fn state_snapshot(&self) -> (u16, u16, Vec<u8>) {
+        let parser = self.parser.lock().unwrap();
+        let (rows, cols) = parser.screen().size();
+        (cols, rows, parser.screen().state_formatted())
     }
 
     pub fn handle_event(&mut self, event: &Event) -> io::Result<()> {
@@ -177,8 +206,14 @@ impl ProjectionTerm {
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> io::Result<()> {
         let application_cursor = self.parser.lock().unwrap().screen().application_cursor();
         if let Some(bytes) = encode_key_event(key_event, application_cursor) {
+            let seq = *self.notify.0.lock().unwrap();
             self.writer.write_all(&bytes)?;
             self.writer.flush()?;
+            let guard = self.notify.0.lock().unwrap();
+            let _ = self
+                .notify
+                .1
+                .wait_timeout_while(guard, Duration::from_millis(12), |s| *s == seq);
         }
 
         Ok(())
@@ -230,6 +265,7 @@ impl ProjectionTerm {
             })
             .map_err(io::Error::other)?;
         self.size = (cols, rows);
+        self.revision.fetch_add(1, Ordering::Release);
 
         Ok(())
     }

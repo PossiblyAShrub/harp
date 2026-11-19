@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(picker.spec().cwd, PathBuf::from("/tmp/work"));
 
         picker.handle_key(key(KeyCode::Down));
-        assert_eq!(picker.spec().program, "/home/aolse/.asdf/shims/nvim");
+        assert_eq!(picker.spec().program, "nvim");
 
         picker.handle_key(key(KeyCode::Down));
         assert_eq!(picker.spec().program, "lazygit");

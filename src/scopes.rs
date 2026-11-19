@@ -1,4 +1,7 @@
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
@@ -9,7 +12,10 @@ use ratatui::{
     widgets::{Block, Widget},
 };
 
-use crate::projections::{Mode, ProjectionStatus, ProjectionTerm};
+use crate::{
+    projections::{Mode, ProjectionStatus, ProjectionTerm},
+    protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeSpec {
@@ -256,6 +262,73 @@ impl TileNode {
         }
     }
 
+    fn term_revision_sum(&self) -> u64 {
+        match self {
+            TileNode::Leaf { projection, .. } => match projection {
+                Projection::Term(term) => term.revision(),
+                Projection::Status(_) => 0,
+                Projection::Scope(scope) => scope.revision(),
+            },
+            TileNode::Split { children, .. } => children
+                .iter()
+                .map(|c| c.node.term_revision_sum())
+                .fold(0u64, |acc, r| acc.wrapping_add(r)),
+        }
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            TileNode::Leaf { .. } => 1,
+            TileNode::Split { children, .. } => {
+                children.iter().map(|c| c.node.leaf_count()).sum()
+            }
+        }
+    }
+
+    fn to_snapshot(&self) -> Option<SnapshotNode> {
+        match self {
+            TileNode::Leaf { id, projection } => match projection {
+                Projection::Term(term) => {
+                    let (cols, rows, state) = term.state_snapshot();
+                    Some(SnapshotNode::Leaf {
+                        id: *id,
+                        cols,
+                        rows,
+                        state,
+                    })
+                }
+                _ => None,
+            },
+            TileNode::Split {
+                direction,
+                children,
+            } => {
+                let dir = match direction {
+                    Direction::Horizontal => SplitDir::Horizontal,
+                    Direction::Vertical => SplitDir::Vertical,
+                };
+                let snap_children: Vec<SnapshotChild> = children
+                    .iter()
+                    .filter_map(|c| {
+                        let fill = match c.constraint {
+                            Constraint::Fill(n) => n,
+                            _ => 1,
+                        };
+                        c.node.to_snapshot().map(|node| SnapshotChild { fill, node })
+                    })
+                    .collect();
+                if snap_children.is_empty() {
+                    None
+                } else {
+                    Some(SnapshotNode::Split {
+                        direction: dir,
+                        children: snap_children,
+                    })
+                }
+            }
+        }
+    }
+
     fn split_leaf(
         &mut self,
         target_id: usize,
@@ -393,6 +466,7 @@ pub struct Scope {
     focused_id: usize,
     next_id: usize,
     area: Rect,
+    layout_revision: u64,
 }
 
 impl Scope {
@@ -431,12 +505,23 @@ impl Scope {
             focused_id,
             next_id,
             area,
+            layout_revision: 1,
         };
         scope.resize(area)?;
         Ok(scope)
     }
 
     pub fn with_terminals(count: usize, direction: Direction, area: Rect) -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        Self::with_terminals_in(count, direction, area, &cwd)
+    }
+
+    pub fn with_terminals_in(
+        count: usize,
+        direction: Direction,
+        area: Rect,
+        cwd: &Path,
+    ) -> Result<Self> {
         let constraints = vec![Constraint::Fill(1); count];
         let rects = Layout::new(direction, constraints).split(area);
         let mut children = Vec::with_capacity(count);
@@ -444,11 +529,35 @@ impl Scope {
             let inner = pane_inner(*rect);
             children.push((
                 Constraint::Fill(1),
-                Projection::Term(ProjectionTerm::with_size(inner.width, inner.height)?),
+                Projection::Term(ProjectionTerm::with_command(
+                    inner.width,
+                    inner.height,
+                    "zsh",
+                    cwd,
+                )?),
             ));
         }
 
         Ok(Self::from_children(direction, children, area)?)
+    }
+
+    pub fn revision(&self) -> u64 {
+        let terms = self.root.as_ref().map_or(0, TileNode::term_revision_sum);
+        self.layout_revision.wrapping_add(terms)
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        self.root.as_ref().map_or(0, TileNode::leaf_count)
+    }
+
+    pub fn snapshot(&self, scope_id: u64) -> Option<ScopeSnapshot> {
+        let root = self.root.as_ref()?.to_snapshot()?;
+        Some(ScopeSnapshot {
+            scope_id,
+            revision: self.revision(),
+            focused_id: self.focused_id,
+            root,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -461,6 +570,7 @@ impl Scope {
 
     pub fn resize(&mut self, area: Rect) -> io::Result<()> {
         self.area = area;
+        self.layout_revision = self.layout_revision.wrapping_add(1);
         if let Some(root) = &mut self.root {
             root.resize(area)?;
         }
@@ -491,6 +601,7 @@ impl Scope {
                     }
                 }
             }
+            self.layout_revision = self.layout_revision.wrapping_add(1);
             self.resize(self.area)?;
         }
         Ok(changed)
@@ -510,6 +621,7 @@ impl Scope {
 
         if let Some(next_id) = find_neighbor(&rects, self.focused_id, current, dir) {
             self.focused_id = next_id;
+            self.layout_revision = self.layout_revision.wrapping_add(1);
         }
     }
 
@@ -553,6 +665,7 @@ impl Scope {
             .is_ok()
         {
             self.focused_id = new_id;
+            self.layout_revision = self.layout_revision.wrapping_add(1);
             self.resize(self.area)?;
         }
 
@@ -611,6 +724,7 @@ impl Scope {
                             ..*mouse_event
                         };
                         self.focused_id = id;
+                        self.layout_revision = self.layout_revision.wrapping_add(1);
                         if let Some(proj) = root.find_mut(id) {
                             return proj.handle_mouse_event(translated);
                         }

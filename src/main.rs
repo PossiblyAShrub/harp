@@ -1,75 +1,198 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{collections::HashMap, io, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     prelude::Buffer,
-    widgets::Widget,
+    style::{Color, Style},
+    widgets::{Block, Widget},
 };
+use tui_term::{vt100, widget::PseudoTerminal};
 
 mod config;
+mod crypto;
 mod picker;
 mod projections;
+mod protocol;
 mod scopes;
+mod server;
+mod switcher;
 
+use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus};
-use scopes::{NavDirection, Projection, Scope, ScopeSpec};
+use protocol::{
+    ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, SplitDir,
+};
+use scopes::NavDirection;
+use switcher::{ScopeSwitcher, SwitcherAction};
 
 struct App {
-    scope: Scope,
+    client: EncryptedStream,
     mode: Mode,
+    status: ProjectionStatus,
     default_cwd: PathBuf,
+    workspace_area: Rect,
+    snapshot: Option<ScopeSnapshot>,
+    parsers: HashMap<usize, vt100::Parser>,
     picker: Option<ScopePicker>,
+    switcher: Option<ScopeSwitcher>,
+    exit: bool,
 }
 
 impl App {
-    fn new(area: Rect) -> Result<Self> {
+    fn new(client: EncryptedStream, area: Rect) -> Result<Self> {
         let mode = Mode::Managing;
         let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let workspace_area = Rect::new(
             area.x,
             area.y,
-            area.width,
-            area.height.saturating_sub(1),
+            area.width.max(1),
+            area.height.saturating_sub(1).max(1),
         );
-        let workspace = Scope::with_terminals(2, Direction::Horizontal, workspace_area)?;
-        let status = ProjectionStatus::new(mode);
 
-        let scope = Scope::from_children(
-            Direction::Vertical,
-            vec![
-                (Constraint::Fill(1), Projection::Scope(Box::new(workspace))),
-                (Constraint::Length(1), Projection::Status(status)),
-            ],
-            area,
-        )?;
-
-        Ok(Self {
-            scope,
+        let mut app = Self {
+            client,
             mode,
-            default_cwd,
+            status: ProjectionStatus::new(mode),
+            default_cwd: default_cwd.clone(),
+            workspace_area,
+            snapshot: None,
+            parsers: HashMap::new(),
             picker: None,
-        })
+            switcher: None,
+            exit: false,
+        };
+
+        app.client.send(&ClientMsg::ListScopes)?;
+        match app.client.recv::<ServerMsg>()? {
+            ServerMsg::Scopes(scopes) if scopes.is_empty() => {
+                app.create_new_scope()?;
+            }
+            ServerMsg::Scopes(scopes) => {
+                app.switcher = Some(ScopeSwitcher::new(scopes, false));
+            }
+            ServerMsg::Error(e) => {
+                app.status.set_error(Some(e));
+            }
+            _ => {}
+        }
+
+        Ok(app)
     }
 
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        self.scope.set_mode(mode);
+        self.status.set_mode(mode);
+    }
+
+    fn apply_snapshot(&mut self, snap: ScopeSnapshot) {
+        let mut active_ids = Vec::new();
+        self.sync_parsers(&snap.root, &mut active_ids);
+        self.parsers.retain(|id, _| active_ids.contains(id));
+        self.snapshot = Some(snap);
+    }
+
+    fn sync_parsers(&mut self, node: &SnapshotNode, active_ids: &mut Vec<usize>) {
+        match node {
+            SnapshotNode::Leaf {
+                id,
+                cols,
+                rows,
+                state,
+            } => {
+                active_ids.push(*id);
+                let mut parser = vt100::Parser::new((*rows).max(1), (*cols).max(1), 0);
+                parser.process(state);
+                self.parsers.insert(*id, parser);
+            }
+            SnapshotNode::Split { children, .. } => {
+                for child in children {
+                    self.sync_parsers(&child.node, active_ids);
+                }
+            }
+        }
+    }
+
+    fn handle_server_reply(&mut self, reply: ServerMsg) -> io::Result<()> {
+        match reply {
+            ServerMsg::Snapshot(snap) => {
+                self.status.set_error(None);
+                self.apply_snapshot(snap);
+            }
+            ServerMsg::Unchanged => {}
+            ServerMsg::ScopeClosed => {
+                self.snapshot = None;
+                self.parsers.clear();
+                self.client.send(&ClientMsg::ListScopes)?;
+                match self.client.recv::<ServerMsg>()? {
+                    ServerMsg::Scopes(scopes) if !scopes.is_empty() => {
+                        self.set_mode(Mode::Managing);
+                        self.switcher = Some(ScopeSwitcher::new(scopes, false));
+                    }
+                    _ => {
+                        self.exit = true;
+                    }
+                }
+            }
+            ServerMsg::Error(e) => {
+                self.status.set_error(Some(e));
+            }
+            ServerMsg::Scopes(_) => {}
+        }
+        Ok(())
+    }
+
+    fn create_new_scope(&mut self) -> io::Result<()> {
+        self.client.send(&ClientMsg::CreateScope {
+            cwd: self.default_cwd.clone(),
+            cols: self.workspace_area.width,
+            rows: self.workspace_area.height,
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)
+    }
+
+    fn attach_scope(&mut self, scope_id: u64) -> io::Result<()> {
+        self.client.send(&ClientMsg::AttachScope {
+            scope_id,
+            cols: self.workspace_area.width,
+            rows: self.workspace_area.height,
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)
+    }
+
+    fn open_switcher(&mut self, allow_cancel: bool) -> io::Result<()> {
+        self.client.send(&ClientMsg::ListScopes)?;
+        match self.client.recv::<ServerMsg>()? {
+            ServerMsg::Scopes(scopes) => {
+                self.switcher = Some(ScopeSwitcher::new(scopes, allow_cancel));
+            }
+            ServerMsg::Error(e) => self.status.set_error(Some(e)),
+            _ => {}
+        }
+        Ok(())
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-        let size = terminal.size()?;
-        self.scope.resize(Rect::new(0, 0, size.width, size.height))?;
-
-        while self.scope.has_interactive() {
+        while !self.exit {
             terminal.draw(|frame| self.render(frame))?;
+
             if event::poll(Duration::from_millis(16))? {
                 self.handle_events()?;
+            } else if !self.exit {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::Poll {
+                        scope_id: snap.scope_id,
+                        last_revision: snap.revision,
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
             }
-            self.scope.prune_exited()?;
         }
 
         Ok(())
@@ -82,27 +205,70 @@ impl App {
     fn handle_events(&mut self) -> io::Result<()> {
         loop {
             let event = event::read()?;
-            if let Some(picker) = &mut self.picker {
-                match &event {
-                    Event::Key(key_event) => match picker.handle_key(*key_event) {
+
+            if let Event::Resize(cols, rows) = event {
+                self.workspace_area =
+                    Rect::new(0, 0, cols.max(1), rows.saturating_sub(1).max(1));
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::Resize {
+                        scope_id: snap.scope_id,
+                        cols: self.workspace_area.width,
+                        rows: self.workspace_area.height,
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+            } else if let Some(switcher) = &mut self.switcher {
+                if let Event::Key(key_event) = event {
+                    match switcher.handle_key(key_event) {
+                        SwitcherAction::None => {}
+                        SwitcherAction::Cancel => {
+                            if self.snapshot.is_some() {
+                                self.switcher = None;
+                            } else {
+                                self.exit = true;
+                            }
+                        }
+                        SwitcherAction::Attach(id) => {
+                            self.switcher = None;
+                            self.attach_scope(id)?;
+                        }
+                        SwitcherAction::CreateNew => {
+                            self.switcher = None;
+                            self.create_new_scope()?;
+                        }
+                    }
+                }
+            } else if let Some(picker) = &mut self.picker {
+                if let Event::Key(key_event) = event {
+                    match picker.handle_key(key_event) {
                         PickerAction::None => {}
                         PickerAction::Cancel => {
                             self.picker = None;
                         }
                         PickerAction::Confirm { direction, spec } => {
-                            match self.scope.split_focused_with_spec(direction, &spec) {
-                                Ok(()) => {
-                                    self.picker = None;
-                                    self.scope.set_error(None);
-                                }
-                                Err(err) => {
-                                    picker.set_error(Some(format!("Failed to launch: {err}")));
+                            if let Some(snap) = &self.snapshot {
+                                self.client.send(&ClientMsg::Split {
+                                    scope_id: snap.scope_id,
+                                    dir: to_nav_dir(direction),
+                                    spec: RemoteScopeSpec {
+                                        machine: spec.machine,
+                                        cwd: spec.cwd,
+                                        program: spec.program,
+                                    },
+                                })?;
+                                match self.client.recv::<ServerMsg>()? {
+                                    ServerMsg::Error(err) => {
+                                        picker.set_error(Some(format!("Failed to launch: {err}")));
+                                    }
+                                    reply => {
+                                        self.picker = None;
+                                        self.handle_server_reply(reply)?;
+                                    }
                                 }
                             }
                         }
-                    },
-                    Event::Resize(_, _) => self.scope.handle_event(&event)?,
-                    _ => {}
+                    }
                 }
             } else {
                 match self.mode {
@@ -116,7 +282,22 @@ impl App {
                         {
                             self.set_mode(Mode::Managing);
                         }
-                        _ => self.scope.handle_event(&event)?,
+                        _ => {
+                            let ignore = matches!(
+                                &event,
+                                Event::Key(k) if k.kind == KeyEventKind::Release
+                            );
+                            if !ignore {
+                                if let Some(snap) = &self.snapshot {
+                                    self.client.send(&ClientMsg::Input {
+                                        scope_id: snap.scope_id,
+                                        event,
+                                    })?;
+                                    let reply = self.client.recv::<ServerMsg>()?;
+                                    self.handle_server_reply(reply)?;
+                                }
+                            }
+                        }
                     },
                     Mode::Managing => match &event {
                         Event::Key(key_event)
@@ -125,60 +306,131 @@ impl App {
                                 KeyEventKind::Press | KeyEventKind::Repeat
                             ) =>
                         {
+                            self.status.set_error(None);
                             if key_event.code == KeyCode::Enter
                                 && !key_event
                                     .modifiers
                                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                             {
-                                self.scope.set_error(None);
                                 self.set_mode(Mode::Interacting);
+                            } else if key_event.code == KeyCode::Char('q')
+                                && key_event.modifiers == KeyModifiers::NONE
+                            {
+                                self.exit = true;
+                            } else if key_event.code == KeyCode::Char('s')
+                                && key_event.modifiers == KeyModifiers::NONE
+                            {
+                                self.open_switcher(true)?;
                             } else if let Some(dir) = arrow_direction(key_event.code) {
                                 if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                                    self.scope.set_error(None);
                                     self.picker = Some(ScopePicker::new(
                                         dir,
                                         self.default_cwd.clone(),
                                     ));
-                                } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                    let spec = ScopeSpec::default_zsh(self.default_cwd.clone());
-                                    if let Err(err) =
-                                        self.scope.split_focused_with_spec(dir, &spec)
-                                    {
-                                        self.scope.set_error(Some(format!(
-                                            "Failed to launch: {err}"
-                                        )));
+                                } else if let Some(snap) = &self.snapshot {
+                                    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                                        self.client.send(&ClientMsg::Split {
+                                            scope_id: snap.scope_id,
+                                            dir: to_nav_dir(dir),
+                                            spec: RemoteScopeSpec {
+                                                machine: "localhost".to_string(),
+                                                cwd: self.default_cwd.clone(),
+                                                program: "zsh".to_string(),
+                                            },
+                                        })?;
                                     } else {
-                                        self.scope.set_error(None);
+                                        self.client.send(&ClientMsg::MoveFocus {
+                                            scope_id: snap.scope_id,
+                                            dir: to_nav_dir(dir),
+                                        })?;
                                     }
-                                } else {
-                                    self.scope.set_error(None);
-                                    self.scope
-                                        .handle_managing_key(*key_event)
-                                        .map_err(io::Error::other)?;
+                                    let reply = self.client.recv::<ServerMsg>()?;
+                                    self.handle_server_reply(reply)?;
                                 }
-                            } else {
-                                self.scope.set_error(None);
-                                self.scope
-                                    .handle_managing_key(*key_event)
-                                    .map_err(io::Error::other)?;
                             }
                         }
-                        Event::Resize(_, _) | Event::Mouse(_) => {
-                            self.scope.handle_event(&event)?;
+                        Event::Mouse(_) => {
+                            if let Some(snap) = &self.snapshot {
+                                self.client.send(&ClientMsg::Input {
+                                    scope_id: snap.scope_id,
+                                    event,
+                                })?;
+                                let reply = self.client.recv::<ServerMsg>()?;
+                                self.handle_server_reply(reply)?;
+                            }
                         }
                         _ => {}
                     },
                 }
             }
 
-            self.scope.prune_exited()?;
-
-            if !self.scope.has_interactive() || !event::poll(Duration::ZERO)? {
+            if self.exit || !event::poll(Duration::ZERO)? {
                 break;
             }
         }
 
         Ok(())
+    }
+
+    fn render_snapshot_node(
+        &self,
+        node: &SnapshotNode,
+        area: Rect,
+        buf: &mut Buffer,
+        focused_id: usize,
+    ) {
+        match node {
+            SnapshotNode::Leaf { id, .. } => {
+                let border_style = if *id == focused_id {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let block = Block::bordered().border_style(border_style);
+                let inner = block.inner(area);
+                block.render(area, buf);
+                if let Some(parser) = self.parsers.get(id) {
+                    PseudoTerminal::new(parser.screen()).render(inner, buf);
+                }
+            }
+            SnapshotNode::Split {
+                direction,
+                children,
+            } => {
+                let dir = match direction {
+                    SplitDir::Horizontal => Direction::Horizontal,
+                    SplitDir::Vertical => Direction::Vertical,
+                };
+                let constraints: Vec<Constraint> =
+                    children.iter().map(|c| Constraint::Fill(c.fill)).collect();
+                let rects = Layout::new(dir, constraints).split(area);
+                for (child, rect) in children.iter().zip(rects.iter()) {
+                    self.render_snapshot_node(&child.node, *rect, buf, focused_id);
+                }
+            }
+        }
+    }
+}
+
+impl Widget for &App {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let chunks = Layout::new(
+            Direction::Vertical,
+            [Constraint::Fill(1), Constraint::Length(1)],
+        )
+        .split(area);
+
+        if let Some(snap) = &self.snapshot {
+            self.render_snapshot_node(&snap.root, chunks[0], buf, snap.focused_id);
+        }
+        self.status.render(chunks[1], buf);
+
+        if let Some(picker) = &self.picker {
+            picker.render(area, buf);
+        }
+        if let Some(switcher) = &self.switcher {
+            switcher.render(area, buf);
+        }
     }
 }
 
@@ -192,20 +444,44 @@ fn arrow_direction(code: KeyCode) -> Option<NavDirection> {
     }
 }
 
-impl Widget for &App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        self.scope.render(area, buf);
-        if let Some(picker) = &self.picker {
-            picker.render(area, buf);
-        }
+fn to_nav_dir(dir: NavDirection) -> NavDir {
+    match dir {
+        NavDirection::Up => NavDir::Up,
+        NavDirection::Down => NavDir::Down,
+        NavDirection::Left => NavDir::Left,
+        NavDirection::Right => NavDir::Right,
     }
 }
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut serve = false;
+    let mut addr = server::DEFAULT_ADDR.to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--serve" => serve = true,
+            "--bind" | "--connect" => {
+                if let Some(val) = args.get(i + 1) {
+                    addr = val.clone();
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if serve {
+        return server::run_server(&addr);
+    }
+
+    let client = server::connect_or_spawn(&addr)?;
     ratatui::run(|terminal| {
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
-        let mut app = App::new(area).map_err(io::Error::other)?;
+        let mut app = App::new(client, area).map_err(io::Error::other)?;
         app.run(terminal)
     })?;
 
