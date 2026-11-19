@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -20,9 +20,14 @@ impl App {
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let size = terminal.size()?;
+        self.term.resize(size.width, size.height)?;
+
         while !self.exit {
-            self.handle_events()?;
             terminal.draw(|frame| self.render(frame))?;
+            if event::poll(Duration::from_millis(16))? {
+                self.handle_events()?;
+            }
         }
 
         Ok(())
@@ -33,12 +38,20 @@ impl App {
     }
 
     fn handle_events(&mut self) -> io::Result<()> {
-        match event::read()? {
-            Event::Key(key_event) if key_event.kind == KeyEventKind::Press && key_event.code == KeyCode::Esc => {
-                self.exit = true;
+        loop {
+            match event::read()? {
+                Event::Key(key_event)
+                    if key_event.kind == KeyEventKind::Press && key_event.code == KeyCode::Esc =>
+                {
+                    self.exit = true;
+                    break;
+                }
+                event => self.term.handle_event(&event)?,
             }
-            Event::Key(key_event) => self.term.handle_key_event(key_event)?,
-            _ => {}
+
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
         }
 
         Ok(())
