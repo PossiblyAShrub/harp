@@ -1,5 +1,6 @@
 use std::{
     io::{self, Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -61,7 +62,7 @@ impl Widget for &ProjectionStatus {
                     .fg(Color::Black)
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-                " Enter: interact | Arrows: focus | Ctrl+Arrows: split",
+                " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Ctrl+Shift+Arrows: custom",
             ),
         };
 
@@ -88,6 +89,11 @@ impl ProjectionTerm {
     }
 
     pub fn with_size(cols: u16, rows: u16) -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new("/").to_path_buf());
+        Self::with_command(cols, rows, "zsh", &cwd)
+    }
+
+    pub fn with_command(cols: u16, rows: u16, program: &str, cwd: &Path) -> Result<Self> {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -98,7 +104,8 @@ impl ProjectionTerm {
             pixel_height: 0,
         })?;
 
-        let cmd = CommandBuilder::new("zsh");
+        let mut cmd = CommandBuilder::new(program);
+        cmd.cwd(cwd);
         let mut child = pty.slave.spawn_command(cmd)?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));

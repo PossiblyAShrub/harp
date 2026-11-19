@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -9,20 +9,25 @@ use ratatui::{
     widgets::Widget,
 };
 
+mod picker;
 mod projections;
 mod scopes;
 
+use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus};
-use scopes::{Projection, Scope};
+use scopes::{NavDirection, Projection, Scope, ScopeSpec};
 
 struct App {
     scope: Scope,
     mode: Mode,
+    default_cwd: PathBuf,
+    picker: Option<ScopePicker>,
 }
 
 impl App {
     fn new(area: Rect) -> Result<Self> {
         let mode = Mode::Managing;
+        let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let workspace_area = Rect::new(
             area.x,
             area.y,
@@ -41,7 +46,12 @@ impl App {
             area,
         )?;
 
-        Ok(Self { scope, mode })
+        Ok(Self {
+            scope,
+            mode,
+            default_cwd,
+            picker: None,
+        })
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -71,38 +81,78 @@ impl App {
     fn handle_events(&mut self) -> io::Result<()> {
         loop {
             let event = event::read()?;
-            match self.mode {
-                Mode::Interacting => match &event {
-                    Event::Key(key_event)
-                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                            && key_event.code == KeyCode::Char(' ')
-                            && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        self.set_mode(Mode::Managing);
-                    }
-                    _ => self.scope.handle_event(&event)?,
-                },
-                Mode::Managing => match &event {
-                    Event::Key(key_event)
-                        if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                    {
-                        if key_event.code == KeyCode::Enter
-                            && !key_event
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        {
-                            self.set_mode(Mode::Interacting);
-                        } else {
+            if let Some(picker) = &mut self.picker {
+                match &event {
+                    Event::Key(key_event) => match picker.handle_key(*key_event) {
+                        PickerAction::None => {}
+                        PickerAction::Cancel => {
+                            self.picker = None;
+                        }
+                        PickerAction::Confirm { direction, spec } => {
+                            self.picker = None;
                             self.scope
-                                .handle_managing_key(*key_event)
+                                .split_focused_with_spec(direction, &spec)
                                 .map_err(io::Error::other)?;
                         }
-                    }
-                    Event::Resize(_, _) | Event::Mouse(_) => {
-                        self.scope.handle_event(&event)?;
-                    }
+                    },
+                    Event::Resize(_, _) => self.scope.handle_event(&event)?,
                     _ => {}
-                },
+                }
+            } else {
+                match self.mode {
+                    Mode::Interacting => match &event {
+                        Event::Key(key_event)
+                            if matches!(
+                                key_event.kind,
+                                KeyEventKind::Press | KeyEventKind::Repeat
+                            ) && key_event.code == KeyCode::Char(' ')
+                                && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.set_mode(Mode::Managing);
+                        }
+                        _ => self.scope.handle_event(&event)?,
+                    },
+                    Mode::Managing => match &event {
+                        Event::Key(key_event)
+                            if matches!(
+                                key_event.kind,
+                                KeyEventKind::Press | KeyEventKind::Repeat
+                            ) =>
+                        {
+                            if key_event.code == KeyCode::Enter
+                                && !key_event
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            {
+                                self.set_mode(Mode::Interacting);
+                            } else if let Some(dir) = arrow_direction(key_event.code) {
+                                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                                    self.picker = Some(ScopePicker::new(
+                                        dir,
+                                        self.default_cwd.clone(),
+                                    ));
+                                } else if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                                    let spec = ScopeSpec::default_zsh(self.default_cwd.clone());
+                                    self.scope
+                                        .split_focused_with_spec(dir, &spec)
+                                        .map_err(io::Error::other)?;
+                                } else {
+                                    self.scope
+                                        .handle_managing_key(*key_event)
+                                        .map_err(io::Error::other)?;
+                                }
+                            } else {
+                                self.scope
+                                    .handle_managing_key(*key_event)
+                                    .map_err(io::Error::other)?;
+                            }
+                        }
+                        Event::Resize(_, _) | Event::Mouse(_) => {
+                            self.scope.handle_event(&event)?;
+                        }
+                        _ => {}
+                    },
+                }
             }
 
             self.scope.prune_exited()?;
@@ -116,9 +166,22 @@ impl App {
     }
 }
 
+fn arrow_direction(code: KeyCode) -> Option<NavDirection> {
+    match code {
+        KeyCode::Up => Some(NavDirection::Up),
+        KeyCode::Down => Some(NavDirection::Down),
+        KeyCode::Left => Some(NavDirection::Left),
+        KeyCode::Right => Some(NavDirection::Right),
+        _ => None,
+    }
+}
+
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.scope.render(area, buf);
+        if let Some(picker) = &self.picker {
+            picker.render(area, buf);
+        }
     }
 }
 

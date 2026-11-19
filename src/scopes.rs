@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, path::PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
@@ -10,6 +10,23 @@ use ratatui::{
 };
 
 use crate::projections::{Mode, ProjectionStatus, ProjectionTerm};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeSpec {
+    pub machine: String,
+    pub cwd: PathBuf,
+    pub program: String,
+}
+
+impl ScopeSpec {
+    pub fn default_zsh(cwd: PathBuf) -> Self {
+        Self {
+            machine: "localhost".to_string(),
+            cwd,
+            program: "zsh".to_string(),
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum NavDirection {
@@ -472,9 +489,25 @@ impl Scope {
     }
 
     pub fn split_focused(&mut self, dir: NavDirection) -> Result<()> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        self.split_focused_with_spec(dir, &ScopeSpec::default_zsh(cwd))
+    }
+
+    pub fn split_focused_with_spec(&mut self, dir: NavDirection, spec: &ScopeSpec) -> Result<()> {
+        if let Some(root) = &mut self.root {
+            if let Some(Projection::Scope(nested)) = root.find_mut(self.focused_id) {
+                return nested.split_focused_with_spec(dir, spec);
+            }
+        }
+
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let term = ProjectionTerm::with_size(inner.width, inner.height)?;
+            let term = ProjectionTerm::with_command(
+                inner.width,
+                inner.height,
+                &spec.program,
+                &spec.cwd,
+            )?;
             let id = self.next_id;
             self.next_id += 1;
             self.root = Some(TileNode::Leaf {
@@ -488,7 +521,8 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder = Projection::Term(ProjectionTerm::with_size(1, 1)?);
+        let placeholder =
+            Projection::Term(ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?);
         if root
             .split_leaf(self.focused_id, dir, new_id, placeholder)
             .is_ok()
