@@ -12,24 +12,88 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::widgets::Widget;
+use ratatui::{
+    layout::Rect,
+    prelude::Buffer,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Paragraph, Widget},
+};
 use tui_term::{
     vt100::{self, MouseProtocolEncoding, MouseProtocolMode},
     widget::PseudoTerminal,
 };
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Interacting,
+    Managing,
+}
+
+pub struct ProjectionStatus {
+    mode: Mode,
+}
+
+impl ProjectionStatus {
+    pub fn new(mode: Mode) -> Self {
+        Self { mode }
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+}
+
+impl Widget for &ProjectionStatus {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let (badge, badge_style, hint) = match self.mode {
+            Mode::Interacting => (
+                " INTERACTING ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                " Ctrl+Space: manage",
+            ),
+            Mode::Managing => (
+                " MANAGING ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                " Enter: interact | Arrows: focus | Ctrl+Arrows: split",
+            ),
+        };
+
+        let line = Line::from(vec![
+            Span::styled(badge, badge_style),
+            Span::styled(hint, Style::default().fg(Color::Gray)),
+        ]);
+
+        Paragraph::new(line).render(area, buf);
+    }
+}
 
 pub struct ProjectionTerm {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     exited: Arc<AtomicBool>,
+    size: (u16, u16),
 }
 
 impl ProjectionTerm {
     pub fn new() -> Result<Self> {
+        Self::with_size(80, 24)
+    }
+
+    pub fn with_size(cols: u16, rows: u16) -> Result<Self> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+
         let pty = native_pty_system().openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -37,7 +101,7 @@ impl ProjectionTerm {
         let cmd = CommandBuilder::new("zsh");
         let mut child = pty.slave.spawn_command(cmd)?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 1000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
         let exited = Arc::new(AtomicBool::new(false));
 
         let mut reader = pty.master.try_clone_reader()?;
@@ -65,6 +129,7 @@ impl ProjectionTerm {
             writer,
             parser,
             exited,
+            size: (cols, rows),
         })
     }
 
@@ -124,6 +189,10 @@ impl ProjectionTerm {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
+        if self.size == (cols, rows) {
+            return Ok(());
+        }
+
         self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
         self.master
             .resize(PtySize {
@@ -132,7 +201,10 @@ impl ProjectionTerm {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+        self.size = (cols, rows);
+
+        Ok(())
     }
 }
 
