@@ -1,6 +1,9 @@
 use std::{
     io::{self, Read, Write},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
@@ -19,6 +22,7 @@ pub struct ProjectionTerm {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    exited: Arc<AtomicBool>,
 }
 
 impl ProjectionTerm {
@@ -34,10 +38,12 @@ impl ProjectionTerm {
         let mut child = pty.slave.spawn_command(cmd)?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 1000)));
+        let exited = Arc::new(AtomicBool::new(false));
 
         let mut reader = pty.master.try_clone_reader()?;
         let writer = pty.master.take_writer()?;
         let parser_clone = Arc::clone(&parser);
+        let exited_clone = Arc::clone(&exited);
 
         thread::spawn(move || {
             let mut buffer = [0u8; 4096];
@@ -50,14 +56,20 @@ impl ProjectionTerm {
                 parser_clone.lock().unwrap().process(&buffer[..n]);
             }
 
-            let _ = child.kill();
+            let _ = child.wait();
+            exited_clone.store(true, Ordering::Release);
         });
 
         Ok(Self {
             master: pty.master,
             writer,
             parser,
+            exited,
         })
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
     }
 
     pub fn handle_event(&mut self, event: &Event) -> io::Result<()> {

@@ -1,21 +1,19 @@
 use std::{io, time::Duration};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event;
 use ratatui::{DefaultTerminal, Frame, prelude::{Buffer, Rect}, widgets::Widget};
 
 mod projections;
 
 struct App {
     term: projections::ProjectionTerm,
-    exit: bool,
 }
 
 impl App {
     fn new() -> Result<Self> {
         Ok(Self {
             term: projections::ProjectionTerm::new()?,
-            exit: false,
         })
     }
 
@@ -23,7 +21,7 @@ impl App {
         let size = terminal.size()?;
         self.term.resize(size.width, size.height)?;
 
-        while !self.exit {
+        while !self.term.is_exited() {
             terminal.draw(|frame| self.render(frame))?;
             if event::poll(Duration::from_millis(16))? {
                 self.handle_events()?;
@@ -39,17 +37,10 @@ impl App {
 
     fn handle_events(&mut self) -> io::Result<()> {
         loop {
-            match event::read()? {
-                Event::Key(key_event)
-                    if key_event.kind == KeyEventKind::Press && key_event.code == KeyCode::Esc =>
-                {
-                    self.exit = true;
-                    break;
-                }
-                event => self.term.handle_event(&event)?,
-            }
+            let event = event::read()?;
+            self.term.handle_event(&event)?;
 
-            if !event::poll(Duration::ZERO)? {
+            if self.term.is_exited() || !event::poll(Duration::ZERO)? {
                 break;
             }
         }
