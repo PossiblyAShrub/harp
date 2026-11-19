@@ -222,6 +222,35 @@ impl ServerState {
                     None => ServerMsg::ScopeClosed,
                 }
             }
+            ClientMsg::NewTab { scope_id, spec } => {
+                let Some(entry) = self.find_mut(scope_id) else {
+                    return ServerMsg::ScopeClosed;
+                };
+                let scope_spec = ScopeSpec {
+                    machine: spec.machine,
+                    cwd: spec.cwd,
+                    program: spec.program,
+                };
+                if let Err(e) = entry.scope.new_tab_with_spec(&scope_spec) {
+                    return ServerMsg::Error(e.to_string());
+                }
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
+                    Some(s) => ServerMsg::Snapshot(s),
+                    None => ServerMsg::ScopeClosed,
+                }
+            }
+            ClientMsg::SwitchTab { scope_id, dir } => {
+                let Some(entry) = self.find_mut(scope_id) else {
+                    return ServerMsg::ScopeClosed;
+                };
+                entry.scope.switch_tab(dir);
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
+                    Some(s) => ServerMsg::Snapshot(s),
+                    None => ServerMsg::ScopeClosed,
+                }
+            }
         }
     }
 }

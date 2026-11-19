@@ -104,7 +104,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                    " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | s: scopes | r: rename | q: detach",
+                    " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
                 ),
             };
 
@@ -137,6 +137,7 @@ pub struct ProjectionTerm {
     revision: Arc<AtomicU64>,
     notify: Arc<(Mutex<u64>, Condvar)>,
     size: (u16, u16),
+    program: String,
 }
 
 impl ProjectionTerm {
@@ -209,11 +210,20 @@ impl ProjectionTerm {
             revision,
             notify,
             size: (cols, rows),
+            program: program.to_string(),
         })
     }
 
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
+    }
+
+    pub fn title(&self) -> String {
+        Path::new(&self.program)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.program.clone())
     }
 
     pub fn revision(&self) -> u64 {

@@ -28,6 +28,9 @@ pub enum PickerAction {
         direction: NavDirection,
         spec: ScopeSpec,
     },
+    ConfirmTab {
+        spec: ScopeSpec,
+    },
 }
 
 pub struct ScopePicker {
@@ -38,18 +41,33 @@ pub struct ScopePicker {
     cwd: String,
     cursor: usize,
     error: Option<String>,
+    is_tab: bool,
 }
 
 impl ScopePicker {
     pub fn new(direction: NavDirection, default_cwd: PathBuf) -> Self {
         let programs = load_programs(&default_cwd, default_harp_config_dir().as_deref());
-        Self::with_programs(direction, default_cwd, programs)
+        Self::with_programs_mode(direction, default_cwd, programs, false)
+    }
+
+    pub fn for_tab(default_cwd: PathBuf) -> Self {
+        let programs = load_programs(&default_cwd, default_harp_config_dir().as_deref());
+        Self::with_programs_mode(NavDirection::Right, default_cwd, programs, true)
     }
 
     pub fn with_programs(
         direction: NavDirection,
         default_cwd: PathBuf,
         programs: Vec<ProgramOption>,
+    ) -> Self {
+        Self::with_programs_mode(direction, default_cwd, programs, false)
+    }
+
+    fn with_programs_mode(
+        direction: NavDirection,
+        default_cwd: PathBuf,
+        programs: Vec<ProgramOption>,
+        is_tab: bool,
     ) -> Self {
         let cwd = default_cwd.to_string_lossy().into_owned();
         let cursor = cwd.chars().count();
@@ -61,6 +79,7 @@ impl ScopePicker {
             cwd,
             cursor,
             error: None,
+            is_tab,
         }
     }
 
@@ -99,9 +118,14 @@ impl ScopePicker {
         match key_event.code {
             KeyCode::Esc => return PickerAction::Cancel,
             KeyCode::Enter => {
-                return PickerAction::Confirm {
-                    direction: self.direction,
-                    spec: self.spec(),
+                let spec = self.spec();
+                return if self.is_tab {
+                    PickerAction::ConfirmTab { spec }
+                } else {
+                    PickerAction::Confirm {
+                        direction: self.direction,
+                        spec,
+                    }
                 };
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -180,13 +204,18 @@ impl Widget for &ScopePicker {
 
         Clear.render(popup, buf);
 
-        let dir_label = match self.direction {
-            NavDirection::Up => "Up",
-            NavDirection::Down => "Down",
-            NavDirection::Left => "Left",
-            NavDirection::Right => "Right",
+        let title = if self.is_tab {
+            " New Tab ".to_string()
+        } else {
+            let dir_label = match self.direction {
+                NavDirection::Up => "Up",
+                NavDirection::Down => "Down",
+                NavDirection::Left => "Left",
+                NavDirection::Right => "Right",
+            };
+            format!(" New Scope ({dir_label}) ")
         };
-        let outer = Block::bordered().title(format!(" New Scope ({dir_label}) "));
+        let outer = Block::bordered().title(title);
         let inner = outer.inner(popup);
         outer.render(popup, buf);
 
@@ -350,5 +379,20 @@ mod tests {
     fn picker_cancels_on_esc() {
         let mut picker = ScopePicker::new(NavDirection::Left, PathBuf::from("/tmp"));
         assert_eq!(picker.handle_key(key(KeyCode::Esc)), PickerAction::Cancel);
+    }
+
+    #[test]
+    fn picker_for_tab_confirms_tab_action() {
+        let mut picker = ScopePicker::for_tab(PathBuf::from("/tmp/work"));
+        picker.handle_key(key(KeyCode::Tab));
+        picker.handle_key(key(KeyCode::Char('/')));
+        picker.handle_key(key(KeyCode::Char('a')));
+        match picker.handle_key(key(KeyCode::Enter)) {
+            PickerAction::ConfirmTab { spec } => {
+                assert_eq!(spec.cwd, PathBuf::from("/tmp/work/a"));
+                assert_eq!(spec.program, "zsh");
+            }
+            other => panic!("expected ConfirmTab, got {other:?}"),
+        }
     }
 }

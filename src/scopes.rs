@@ -4,16 +4,14 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{Event, MouseEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
-    prelude::Buffer,
-    style::{Color, Style},
-    widgets::{Block, Widget},
+    widgets::Block,
 };
 
 use crate::{
-    projections::{Mode, ProjectionStatus, ProjectionTerm},
+    projections::ProjectionTerm,
     protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
 };
 
@@ -57,16 +55,12 @@ impl NavDirection {
 
 pub enum Projection {
     Term(ProjectionTerm),
-    Status(ProjectionStatus),
-    Scope(Box<Scope>),
 }
 
 impl Projection {
     fn is_exited(&self) -> bool {
         match self {
             Projection::Term(term) => term.is_exited(),
-            Projection::Status(_) => false,
-            Projection::Scope(scope) => scope.is_empty(),
         }
     }
 
@@ -80,65 +74,30 @@ impl Projection {
                 let inner = pane_inner(rect);
                 term.resize(inner.width, inner.height)
             }
-            Projection::Status(_) => Ok(()),
-            Projection::Scope(scope) => scope.resize(rect),
         }
     }
 
     fn handle_event(&mut self, event: &Event) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_event(event),
-            Projection::Status(_) => Ok(()),
-            Projection::Scope(scope) => scope.handle_event(event),
         }
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_mouse_event(mouse_event),
-            Projection::Status(_) => Ok(()),
-            Projection::Scope(scope) => scope.handle_event(&Event::Mouse(mouse_event)),
-        }
-    }
-
-    fn set_mode(&mut self, mode: Mode) {
-        match self {
-            Projection::Term(_) => {}
-            Projection::Status(status) => status.set_mode(mode),
-            Projection::Scope(scope) => scope.set_mode(mode),
-        }
-    }
-
-    fn set_error(&mut self, error: Option<String>) {
-        match self {
-            Projection::Term(_) => {}
-            Projection::Status(status) => status.set_error(error),
-            Projection::Scope(scope) => scope.set_error(error),
-        }
-    }
-
-    fn is_interactive(&self) -> bool {
-        match self {
-            Projection::Term(_) => true,
-            Projection::Status(_) => false,
-            Projection::Scope(scope) => scope.has_interactive(),
         }
     }
 
     fn prune_exited(&mut self) -> io::Result<bool> {
         match self {
-            Projection::Term(_) | Projection::Status(_) => Ok(false),
-            Projection::Scope(scope) => scope.prune_exited(),
+            Projection::Term(_) => Ok(false),
         }
     }
-}
 
-impl Widget for &Projection {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+    fn revision(&self) -> u64 {
         match self {
-            Projection::Term(term) => term.render(area, buf),
-            Projection::Status(status) => status.render(area, buf),
-            Projection::Scope(scope) => scope.render(area, buf),
+            Projection::Term(term) => term.revision(),
         }
     }
 }
@@ -148,9 +107,15 @@ struct TileChild {
     node: TileNode,
 }
 
+struct TabPage {
+    id: usize,
+    projection: Projection,
+}
+
 enum TileNode {
     Leaf { id: usize, projection: Projection },
     Split { direction: Direction, children: Vec<TileChild> },
+    Tabs { pages: Vec<TabPage>, active: usize },
 }
 
 impl TileNode {
@@ -164,6 +129,11 @@ impl TileNode {
                 let rects = Layout::new(*direction, constraints).split(area);
                 for (child, rect) in children.iter().zip(rects.iter()) {
                     child.node.collect_rects(*rect, out);
+                }
+            }
+            TileNode::Tabs { pages, active } => {
+                if let Some(page) = pages.get(*active) {
+                    out.push((page.id, area, true));
                 }
             }
         }
@@ -180,6 +150,14 @@ impl TileNode {
                 }
                 None
             }
+            TileNode::Tabs { pages, .. } => {
+                for page in pages {
+                    if page.id == target_id {
+                        return Some(&mut page.projection);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -189,6 +167,7 @@ impl TileNode {
             TileNode::Split { children, .. } => {
                 children.iter().find_map(|c| c.node.first_leaf_id())
             }
+            TileNode::Tabs { pages, .. } => pages.first().map(|p| p.id),
         }
     }
 
@@ -203,62 +182,12 @@ impl TileNode {
                 }
                 Ok(())
             }
-        }
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer, focused_id: usize) {
-        match self {
-            TileNode::Leaf { id, projection } => {
-                if projection.needs_border() {
-                    let border_style = if *id == focused_id {
-                        Style::default().fg(Color::White)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    let block = Block::bordered().border_style(border_style);
-                    let inner = block.inner(area);
-                    block.render(area, buf);
-                    projection.render(inner, buf);
-                } else {
-                    projection.render(area, buf);
+            TileNode::Tabs { pages, .. } => {
+                for page in pages {
+                    page.projection.resize(area)?;
                 }
+                Ok(())
             }
-            TileNode::Split { direction, children } => {
-                let constraints: Vec<Constraint> = children.iter().map(|c| c.constraint).collect();
-                let rects = Layout::new(*direction, constraints).split(area);
-                for (child, rect) in children.iter().zip(rects.iter()) {
-                    child.node.render(*rect, buf, focused_id);
-                }
-            }
-        }
-    }
-
-    fn set_mode(&mut self, mode: Mode) {
-        match self {
-            TileNode::Leaf { projection, .. } => projection.set_mode(mode),
-            TileNode::Split { children, .. } => {
-                for child in children {
-                    child.node.set_mode(mode);
-                }
-            }
-        }
-    }
-
-    fn set_error(&mut self, error: Option<String>) {
-        match self {
-            TileNode::Leaf { projection, .. } => projection.set_error(error),
-            TileNode::Split { children, .. } => {
-                for child in children {
-                    child.node.set_error(error.clone());
-                }
-            }
-        }
-    }
-
-    fn has_interactive(&self) -> bool {
-        match self {
-            TileNode::Leaf { projection, .. } => projection.is_interactive(),
-            TileNode::Split { children, .. } => children.iter().any(|c| c.node.has_interactive()),
         }
     }
 
@@ -266,12 +195,14 @@ impl TileNode {
         match self {
             TileNode::Leaf { projection, .. } => match projection {
                 Projection::Term(term) => term.revision(),
-                Projection::Status(_) => 0,
-                Projection::Scope(scope) => scope.revision(),
             },
             TileNode::Split { children, .. } => children
                 .iter()
                 .map(|c| c.node.term_revision_sum())
+                .fold(0u64, |acc, r| acc.wrapping_add(r)),
+            TileNode::Tabs { pages, .. } => pages
+                .iter()
+                .map(|p| p.projection.revision())
                 .fold(0u64, |acc, r| acc.wrapping_add(r)),
         }
     }
@@ -282,23 +213,22 @@ impl TileNode {
             TileNode::Split { children, .. } => {
                 children.iter().map(|c| c.node.leaf_count()).sum()
             }
+            TileNode::Tabs { pages, .. } => pages.len(),
         }
     }
 
     fn to_snapshot(&self) -> Option<SnapshotNode> {
         match self {
-            TileNode::Leaf { id, projection } => match projection {
-                Projection::Term(term) => {
-                    let (cols, rows, state) = term.state_snapshot();
-                    Some(SnapshotNode::Leaf {
-                        id: *id,
-                        cols,
-                        rows,
-                        state,
-                    })
-                }
-                _ => None,
-            },
+            TileNode::Leaf { id, projection } => {
+                let Projection::Term(term) = projection;
+                let (cols, rows, state) = term.state_snapshot();
+                Some(SnapshotNode::Leaf {
+                    id: *id,
+                    cols,
+                    rows,
+                    state,
+                })
+            }
             TileNode::Split {
                 direction,
                 children,
@@ -323,6 +253,31 @@ impl TileNode {
                     Some(SnapshotNode::Split {
                         direction: dir,
                         children: snap_children,
+                    })
+                }
+            }
+            TileNode::Tabs { pages, active } => {
+                let snap_pages: Vec<crate::protocol::TabPageSnapshot> = pages
+                    .iter()
+                    .map(|page| {
+                        let Projection::Term(term) = &page.projection;
+                        let (cols, rows, state) = term.state_snapshot();
+                        crate::protocol::TabPageSnapshot {
+                            id: page.id,
+                            name: term.title(),
+                            cols,
+                            rows,
+                            state,
+                        }
+                    })
+                    .collect();
+                if snap_pages.is_empty() {
+                    None
+                } else {
+                    let active_idx = (*active).min(snap_pages.len().saturating_sub(1));
+                    Some(SnapshotNode::Tabs {
+                        pages: snap_pages,
+                        active: active_idx,
                     })
                 }
             }
@@ -405,6 +360,133 @@ impl TileNode {
                 }
                 Err(pending.unwrap())
             }
+            TileNode::Tabs { pages, .. } => {
+                if pages.iter().any(|p| p.id == target_id) {
+                    let existing = std::mem::replace(
+                        self,
+                        TileNode::Split {
+                            direction: dir.axis(),
+                            children: Vec::new(),
+                        },
+                    );
+                    let new_leaf = TileNode::Leaf {
+                        id: new_id,
+                        projection: new_projection,
+                    };
+                    let (first, second) = if dir.insert_before() {
+                        (new_leaf, existing)
+                    } else {
+                        (existing, new_leaf)
+                    };
+                    *self = TileNode::Split {
+                        direction: dir.axis(),
+                        children: vec![
+                            TileChild {
+                                constraint: Constraint::Fill(1),
+                                node: first,
+                            },
+                            TileChild {
+                                constraint: Constraint::Fill(1),
+                                node: second,
+                            },
+                        ],
+                    };
+                    Ok(())
+                } else {
+                    Err(new_projection)
+                }
+            }
+        }
+    }
+
+    fn new_tab(
+        &mut self,
+        target_id: usize,
+        new_id: usize,
+        new_projection: Projection,
+    ) -> Result<(), Projection> {
+        match self {
+            TileNode::Leaf { id, .. } => {
+                if *id == target_id {
+                    let existing = std::mem::replace(
+                        self,
+                        TileNode::Tabs {
+                            pages: Vec::new(),
+                            active: 0,
+                        },
+                    );
+                    let existing_leaf = match existing {
+                        TileNode::Leaf { id, projection } => TabPage {
+                            id,
+                            projection,
+                        },
+                        _ => unreachable!("leaf match guaranteed"),
+                    };
+                    *self = TileNode::Tabs {
+                        pages: vec![
+                            existing_leaf,
+                            TabPage {
+                                id: new_id,
+                                projection: new_projection,
+                            },
+                        ],
+                        active: 1,
+                    };
+                    Ok(())
+                } else {
+                    Err(new_projection)
+                }
+            }
+            TileNode::Split { children, .. } => {
+                let mut pending = Some(new_projection);
+                for child in children.iter_mut() {
+                    if let Some(proj) = pending.take() {
+                        match child.node.new_tab(target_id, new_id, proj) {
+                            Ok(()) => return Ok(()),
+                            Err(returned) => pending = Some(returned),
+                        }
+                    }
+                }
+                Err(pending.unwrap())
+            }
+            TileNode::Tabs { pages, active } => {
+                if pages.iter().any(|p| p.id == target_id) {
+                    pages.push(TabPage {
+                        id: new_id,
+                        projection: new_projection,
+                    });
+                    *active = pages.len() - 1;
+                    Ok(())
+                } else {
+                    Err(new_projection)
+                }
+            }
+        }
+    }
+
+    fn switch_tab(&mut self, target_id: usize, dir: crate::protocol::TabDir) -> Option<usize> {
+        match self {
+            TileNode::Leaf { .. } => None,
+            TileNode::Split { children, .. } => {
+                for child in children {
+                    if let Some(id) = child.node.switch_tab(target_id, dir) {
+                        return Some(id);
+                    }
+                }
+                None
+            }
+            TileNode::Tabs { pages, active } => {
+                if !pages.iter().any(|p| p.id == target_id) {
+                    return None;
+                }
+                let count = pages.len();
+                let next = match dir {
+                    crate::protocol::TabDir::Next => (*active + 1) % count,
+                    crate::protocol::TabDir::Prev => (*active + count - 1) % count,
+                };
+                *active = next;
+                Some(pages[next].id)
+            }
         }
     }
 
@@ -452,6 +534,27 @@ impl TileNode {
                 } else if children.len() == 1 {
                     let only = children.pop().unwrap().node;
                     *node = only;
+                    changed = true;
+                }
+            }
+            TileNode::Tabs { pages, active } => {
+                let mut i = 0;
+                while i < pages.len() {
+                    if pages[i].projection.is_exited() {
+                        pages.remove(i);
+                        changed = true;
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                if pages.is_empty() {
+                    *node_opt = None;
+                    return Ok(true);
+                }
+
+                if *active >= pages.len() {
+                    *active = pages.len() - 1;
                     changed = true;
                 }
             }
@@ -511,11 +614,6 @@ impl Scope {
         Ok(scope)
     }
 
-    pub fn with_terminals(count: usize, direction: Direction, area: Rect) -> Result<Self> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        Self::with_terminals_in(count, direction, area, &cwd)
-    }
-
     pub fn with_terminals_in(
         count: usize,
         direction: Direction,
@@ -569,10 +667,6 @@ impl Scope {
         self.root.is_none()
     }
 
-    pub fn has_interactive(&self) -> bool {
-        self.root.as_ref().is_some_and(TileNode::has_interactive)
-    }
-
     pub fn resize(&mut self, area: Rect) -> io::Result<()> {
         self.area = area;
         self.layout_revision = self.layout_revision.wrapping_add(1);
@@ -580,18 +674,6 @@ impl Scope {
             root.resize(area)?;
         }
         Ok(())
-    }
-
-    pub fn set_mode(&mut self, mode: Mode) {
-        if let Some(root) = &mut self.root {
-            root.set_mode(mode);
-        }
-    }
-
-    pub fn set_error(&mut self, error: Option<String>) {
-        if let Some(root) = &mut self.root {
-            root.set_error(error);
-        }
     }
 
     pub fn prune_exited(&mut self) -> io::Result<bool> {
@@ -630,18 +712,7 @@ impl Scope {
         }
     }
 
-    pub fn split_focused(&mut self, dir: NavDirection) -> Result<()> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        self.split_focused_with_spec(dir, &ScopeSpec::default_zsh(cwd))
-    }
-
     pub fn split_focused_with_spec(&mut self, dir: NavDirection, spec: &ScopeSpec) -> Result<()> {
-        if let Some(root) = &mut self.root {
-            if let Some(Projection::Scope(nested)) = root.find_mut(self.focused_id) {
-                return nested.split_focused_with_spec(dir, spec);
-            }
-        }
-
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
             let term = ProjectionTerm::with_command(
@@ -677,36 +748,53 @@ impl Scope {
         Ok(())
     }
 
-    pub fn handle_managing_key(&mut self, key_event: KeyEvent) -> Result<bool> {
-        if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            return Ok(false);
-        }
-
-        if let Some(root) = &mut self.root {
-            if let Some(Projection::Scope(nested)) = root.find_mut(self.focused_id) {
-                return nested.handle_managing_key(key_event);
-            }
-        }
-
-        let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-        let dir = match key_event.code {
-            KeyCode::Up => Some(NavDirection::Up),
-            KeyCode::Down => Some(NavDirection::Down),
-            KeyCode::Left => Some(NavDirection::Left),
-            KeyCode::Right => Some(NavDirection::Right),
-            _ => None,
+    pub fn new_tab_with_spec(&mut self, spec: &ScopeSpec) -> Result<()> {
+        let Some(root) = &mut self.root else {
+            let inner = pane_inner(self.area);
+            let term = ProjectionTerm::with_command(
+                inner.width,
+                inner.height,
+                &spec.program,
+                &spec.cwd,
+            )?;
+            let id = self.next_id;
+            self.next_id += 1;
+            self.root = Some(TileNode::Leaf {
+                id,
+                projection: Projection::Term(term),
+            });
+            self.focused_id = id;
+            return Ok(());
         };
 
-        if let Some(dir) = dir {
-            if ctrl {
-                self.split_focused(dir)?;
-            } else {
-                self.move_focus(dir);
-            }
-            return Ok(true);
+        let new_id = self.next_id;
+        self.next_id += 1;
+
+        let placeholder =
+            Projection::Term(ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?);
+        if root
+            .new_tab(self.focused_id, new_id, placeholder)
+            .is_ok()
+        {
+            self.focused_id = new_id;
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+            self.resize(self.area)?;
         }
 
-        Ok(false)
+        Ok(())
+    }
+
+    pub fn switch_tab(&mut self, dir: crate::protocol::TabDir) -> bool {
+        let Some(root) = &mut self.root else {
+            return false;
+        };
+        if let Some(new_focus) = root.switch_tab(self.focused_id, dir) {
+            self.focused_id = new_focus;
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn handle_event(&mut self, event: &Event) -> io::Result<()> {
@@ -749,15 +837,7 @@ impl Scope {
     }
 }
 
-impl Widget for &Scope {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if let Some(root) = &self.root {
-            root.render(area, buf, self.focused_id);
-        }
-    }
-}
-
-fn pane_inner(rect: Rect) -> Rect {
+pub fn pane_inner(rect: Rect) -> Rect {
     Block::bordered().inner(rect)
 }
 
@@ -858,5 +938,49 @@ mod tests {
     fn pane_inner_accounts_for_borders() {
         let rect = Rect::new(50, 0, 50, 40);
         assert_eq!(pane_inner(rect), Rect::new(51, 1, 48, 38));
+    }
+
+    #[test]
+    fn new_tab_wraps_leaf_and_switch_tab_moves_active() {
+        let cwd = std::env::temp_dir();
+        let mut scope = Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd).unwrap();
+        assert_eq!(scope.leaf_count(), 1);
+
+        let spec = ScopeSpec::default_zsh(cwd);
+        scope.new_tab_with_spec(&spec).unwrap();
+        assert_eq!(scope.leaf_count(), 2);
+        let initial_focus = scope.focused_id;
+
+        // switching next should move to the new tab (the second page)
+        assert!(scope.switch_tab(crate::protocol::TabDir::Prev));
+        assert_ne!(scope.focused_id, initial_focus);
+        assert!(scope.switch_tab(crate::protocol::TabDir::Next));
+        assert_eq!(scope.focused_id, initial_focus);
+    }
+
+    #[test]
+    fn new_tab_adds_page_to_existing_tab_group() {
+        let cwd = std::env::temp_dir();
+        let mut scope = Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd).unwrap();
+        let spec = ScopeSpec::default_zsh(cwd.clone());
+
+        scope.new_tab_with_spec(&spec).unwrap();
+        assert_eq!(scope.leaf_count(), 2);
+        let first_tab_focus = scope.focused_id;
+
+        // now inside a tab group; another new tab adds a third page without wrapping
+        scope.new_tab_with_spec(&spec).unwrap();
+        assert_eq!(scope.leaf_count(), 3);
+        assert_ne!(scope.focused_id, first_tab_focus);
+
+        // snapshot should be a Tabs node with 3 pages
+        let snap = scope.snapshot(1, "test".to_string()).unwrap();
+        match snap.root {
+            SnapshotNode::Tabs { pages, active } => {
+                assert_eq!(pages.len(), 3);
+                assert_eq!(active, 2);
+            }
+            other => panic!("expected Tabs node, got {other:?}"),
+        }
     }
 }

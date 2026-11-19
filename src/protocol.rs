@@ -17,6 +17,12 @@ pub enum NavDir {
     Right,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TabDir {
+    Next,
+    Prev,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteScopeSpec {
     pub machine: String,
@@ -30,6 +36,15 @@ pub struct ScopeInfo {
     pub name: String,
     pub cwd: PathBuf,
     pub pane_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TabPageSnapshot {
+    pub id: usize,
+    pub name: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub state: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,6 +64,10 @@ pub enum SnapshotNode {
     Split {
         direction: SplitDir,
         children: Vec<SnapshotChild>,
+    },
+    Tabs {
+        pages: Vec<TabPageSnapshot>,
+        active: usize,
     },
 }
 
@@ -99,6 +118,14 @@ pub enum ClientMsg {
         scope_id: u64,
         dir: NavDir,
         spec: RemoteScopeSpec,
+    },
+    NewTab {
+        scope_id: u64,
+        spec: RemoteScopeSpec,
+    },
+    SwitchTab {
+        scope_id: u64,
+        dir: TabDir,
     },
 }
 

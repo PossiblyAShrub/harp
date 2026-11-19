@@ -6,10 +6,9 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Buffer,
-    style::{Color, Style},
-    widgets::{Block, Widget},
+    widgets::Widget,
 };
-use tui_term::{vt100, widget::PseudoTerminal};
+use tui_term::vt100;
 
 mod config;
 mod crypto;
@@ -19,15 +18,15 @@ mod protocol;
 mod scopes;
 mod server;
 mod switcher;
+mod view;
 
 use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus};
-use protocol::{
-    ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, SplitDir,
-};
+use protocol::{ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir};
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
+use view::SnapshotView;
 
 struct App {
     client: EncryptedStream,
@@ -114,6 +113,15 @@ impl App {
             SnapshotNode::Split { children, .. } => {
                 for child in children {
                     self.sync_parsers(&child.node, active_ids);
+                }
+            }
+            SnapshotNode::Tabs { pages, .. } => {
+                for page in pages {
+                    active_ids.push(page.id);
+                    let mut parser =
+                        vt100::Parser::new(page.rows.max(1), page.cols.max(1), 0);
+                    parser.process(&page.state);
+                    self.parsers.insert(page.id, parser);
                 }
             }
         }
@@ -292,6 +300,27 @@ impl App {
                                 }
                             }
                         }
+                        PickerAction::ConfirmTab { spec } => {
+                            if let Some(snap) = &self.snapshot {
+                                self.client.send(&ClientMsg::NewTab {
+                                    scope_id: snap.scope_id,
+                                    spec: RemoteScopeSpec {
+                                        machine: spec.machine,
+                                        cwd: spec.cwd,
+                                        program: spec.program,
+                                    },
+                                })?;
+                                match self.client.recv::<ServerMsg>()? {
+                                    ServerMsg::Error(err) => {
+                                        picker.set_error(Some(format!("Failed to launch: {err}")));
+                                    }
+                                    reply => {
+                                        self.picker = None;
+                                        self.handle_server_reply(reply)?;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
@@ -351,8 +380,46 @@ impl App {
                                 if let Some(snap) = &self.snapshot {
                                     self.rename = Some(RenameModal::new(snap.scope_name.clone()));
                                 }
+                            } else if key_event.code == KeyCode::Char('T')
+                                && !key_event
+                                    .modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                            {
+                                self.picker = Some(ScopePicker::for_tab(self.default_cwd.clone()));
+                            } else if key_event.code == KeyCode::Char('t')
+                                && key_event.modifiers == KeyModifiers::NONE
+                            {
+                                if let Some(snap) = &self.snapshot {
+                                    self.client.send(&ClientMsg::NewTab {
+                                        scope_id: snap.scope_id,
+                                        spec: RemoteScopeSpec {
+                                            machine: "localhost".to_string(),
+                                            cwd: self.default_cwd.clone(),
+                                            program: "zsh".to_string(),
+                                        },
+                                    })?;
+                                    let reply = self.client.recv::<ServerMsg>()?;
+                                    self.handle_server_reply(reply)?;
+                                }
                             } else if let Some(dir) = arrow_direction(key_event.code) {
-                                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                                if key_event.modifiers.contains(KeyModifiers::ALT) {
+                                    if let Some(snap) = &self.snapshot {
+                                        let tab_dir = match dir {
+                                            NavDirection::Left | NavDirection::Up => {
+                                                TabDir::Prev
+                                            }
+                                            NavDirection::Right | NavDirection::Down => {
+                                                TabDir::Next
+                                            }
+                                        };
+                                        self.client.send(&ClientMsg::SwitchTab {
+                                            scope_id: snap.scope_id,
+                                            dir: tab_dir,
+                                        })?;
+                                        let reply = self.client.recv::<ServerMsg>()?;
+                                        self.handle_server_reply(reply)?;
+                                    }
+                                } else if key_event.modifiers.contains(KeyModifiers::SHIFT) {
                                     self.picker = Some(ScopePicker::new(
                                         dir,
                                         self.default_cwd.clone(),
@@ -401,45 +468,6 @@ impl App {
 
         Ok(())
     }
-
-    fn render_snapshot_node(
-        &self,
-        node: &SnapshotNode,
-        area: Rect,
-        buf: &mut Buffer,
-        focused_id: usize,
-    ) {
-        match node {
-            SnapshotNode::Leaf { id, .. } => {
-                let border_style = if *id == focused_id {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let block = Block::bordered().border_style(border_style);
-                let inner = block.inner(area);
-                block.render(area, buf);
-                if let Some(parser) = self.parsers.get(id) {
-                    PseudoTerminal::new(parser.screen()).render(inner, buf);
-                }
-            }
-            SnapshotNode::Split {
-                direction,
-                children,
-            } => {
-                let dir = match direction {
-                    SplitDir::Horizontal => Direction::Horizontal,
-                    SplitDir::Vertical => Direction::Vertical,
-                };
-                let constraints: Vec<Constraint> =
-                    children.iter().map(|c| Constraint::Fill(c.fill)).collect();
-                let rects = Layout::new(dir, constraints).split(area);
-                for (child, rect) in children.iter().zip(rects.iter()) {
-                    self.render_snapshot_node(&child.node, *rect, buf, focused_id);
-                }
-            }
-        }
-    }
 }
 
 impl Widget for &App {
@@ -451,7 +479,7 @@ impl Widget for &App {
         .split(area);
 
         if let Some(snap) = &self.snapshot {
-            self.render_snapshot_node(&snap.root, chunks[0], buf, snap.focused_id);
+            SnapshotView::new(snap, &self.parsers).render(chunks[0], buf);
         }
         self.status.render(chunks[1], buf);
 
