@@ -27,7 +27,7 @@ use protocol::{
     ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, SplitDir,
 };
 use scopes::NavDirection;
-use switcher::{ScopeSwitcher, SwitcherAction};
+use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
 
 struct App {
     client: EncryptedStream,
@@ -39,6 +39,7 @@ struct App {
     parsers: HashMap<usize, vt100::Parser>,
     picker: Option<ScopePicker>,
     switcher: Option<ScopeSwitcher>,
+    rename: Option<RenameModal>,
     exit: bool,
 }
 
@@ -63,6 +64,7 @@ impl App {
             parsers: HashMap::new(),
             picker: None,
             switcher: None,
+            rename: None,
             exit: false,
         };
 
@@ -92,6 +94,7 @@ impl App {
         let mut active_ids = Vec::new();
         self.sync_parsers(&snap.root, &mut active_ids);
         self.parsers.retain(|id, _| active_ids.contains(id));
+        self.status.set_scope_name(Some(snap.scope_name.clone()));
         self.snapshot = Some(snap);
     }
 
@@ -125,6 +128,7 @@ impl App {
             ServerMsg::Unchanged => {}
             ServerMsg::ScopeClosed => {
                 self.snapshot = None;
+                self.status.set_scope_name(None);
                 self.parsers.clear();
                 self.client.send(&ClientMsg::ListScopes)?;
                 match self.client.recv::<ServerMsg>()? {
@@ -239,6 +243,26 @@ impl App {
                         }
                     }
                 }
+            } else if let Some(rename) = &mut self.rename {
+                if let Event::Key(key_event) = event {
+                    match rename.handle_key(key_event) {
+                        RenameAction::None => {}
+                        RenameAction::Cancel => {
+                            self.rename = None;
+                        }
+                        RenameAction::Confirm(name) => {
+                            self.rename = None;
+                            if let Some(snap) = &self.snapshot {
+                                self.client.send(&ClientMsg::RenameScope {
+                                    scope_id: snap.scope_id,
+                                    name,
+                                })?;
+                                let reply = self.client.recv::<ServerMsg>()?;
+                                self.handle_server_reply(reply)?;
+                            }
+                        }
+                    }
+                }
             } else if let Some(picker) = &mut self.picker {
                 if let Event::Key(key_event) = event {
                     match picker.handle_key(key_event) {
@@ -321,6 +345,12 @@ impl App {
                                 && key_event.modifiers == KeyModifiers::NONE
                             {
                                 self.open_switcher(true)?;
+                            } else if key_event.code == KeyCode::Char('r')
+                                && key_event.modifiers == KeyModifiers::NONE
+                            {
+                                if let Some(snap) = &self.snapshot {
+                                    self.rename = Some(RenameModal::new(snap.scope_name.clone()));
+                                }
                             } else if let Some(dir) = arrow_direction(key_event.code) {
                                 if key_event.modifiers.contains(KeyModifiers::SHIFT) {
                                     self.picker = Some(ScopePicker::new(
@@ -430,6 +460,9 @@ impl Widget for &App {
         }
         if let Some(switcher) = &self.switcher {
             switcher.render(area, buf);
+        }
+        if let Some(rename) = &self.rename {
+            rename.render(area, buf);
         }
     }
 }

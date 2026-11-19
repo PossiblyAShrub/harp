@@ -86,7 +86,7 @@ impl ServerState {
                             .map(|n| n.to_string_lossy().into_owned())
                             .filter(|n| !n.is_empty())
                             .unwrap_or_else(|| format!("scope-{id}"));
-                        let snap = scope.snapshot(id);
+                        let snap = scope.snapshot(id, name.clone());
                         self.scopes.push(ServerScope {
                             id,
                             name,
@@ -113,7 +113,23 @@ impl ServerState {
                 if let Err(e) = entry.scope.resize(Rect::new(0, 0, cols.max(1), rows.max(1))) {
                     return ServerMsg::Error(e.to_string());
                 }
-                match entry.scope.snapshot(scope_id) {
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
+                    Some(s) => ServerMsg::Snapshot(s),
+                    None => ServerMsg::ScopeClosed,
+                }
+            }
+            ClientMsg::RenameScope { scope_id, name } => {
+                let Some(entry) = self.find_mut(scope_id) else {
+                    return ServerMsg::ScopeClosed;
+                };
+                let trimmed = name.trim();
+                if !trimmed.is_empty() {
+                    entry.name = trimmed.to_string();
+                    entry.scope.bump_revision();
+                }
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),
                     None => ServerMsg::ScopeClosed,
                 }
@@ -128,7 +144,8 @@ impl ServerState {
                 if entry.scope.revision() == last_revision {
                     ServerMsg::Unchanged
                 } else {
-                    match entry.scope.snapshot(scope_id) {
+                    let name = entry.name.clone();
+                    match entry.scope.snapshot(scope_id, name) {
                         Some(s) => ServerMsg::Snapshot(s),
                         None => ServerMsg::ScopeClosed,
                     }
@@ -145,7 +162,8 @@ impl ServerState {
                 if let Err(e) = entry.scope.resize(Rect::new(0, 0, cols.max(1), rows.max(1))) {
                     return ServerMsg::Error(e.to_string());
                 }
-                match entry.scope.snapshot(scope_id) {
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),
                     None => ServerMsg::ScopeClosed,
                 }
@@ -162,7 +180,8 @@ impl ServerState {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
-                match entry.scope.snapshot(scope_id) {
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),
                     None => ServerMsg::ScopeClosed,
                 }
@@ -172,7 +191,8 @@ impl ServerState {
                     return ServerMsg::ScopeClosed;
                 };
                 entry.scope.move_focus(to_nav_dir(dir));
-                match entry.scope.snapshot(scope_id) {
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),
                     None => ServerMsg::ScopeClosed,
                 }
@@ -196,7 +216,8 @@ impl ServerState {
                 {
                     return ServerMsg::Error(e.to_string());
                 }
-                match entry.scope.snapshot(scope_id) {
+                let name = entry.name.clone();
+                match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),
                     None => ServerMsg::ScopeClosed,
                 }

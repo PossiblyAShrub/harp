@@ -15,7 +15,7 @@ use crossterm::event::{
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     prelude::Buffer,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -35,11 +35,16 @@ pub enum Mode {
 pub struct ProjectionStatus {
     mode: Mode,
     error: Option<String>,
+    scope_name: Option<String>,
 }
 
 impl ProjectionStatus {
     pub fn new(mode: Mode) -> Self {
-        Self { mode, error: None }
+        Self {
+            mode,
+            error: None,
+            scope_name: None,
+        }
     }
 
     pub fn set_mode(&mut self, mode: Mode) {
@@ -49,10 +54,28 @@ impl ProjectionStatus {
     pub fn set_error(&mut self, error: Option<String>) {
         self.error = error;
     }
+
+    pub fn set_scope_name(&mut self, scope_name: Option<String>) {
+        self.scope_name = scope_name;
+    }
 }
 
 impl Widget for &ProjectionStatus {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let scope_label = self
+            .scope_name
+            .as_deref()
+            .map(|name| format!(" {name} "));
+        let right_width = scope_label
+            .as_ref()
+            .map_or(0, |s| s.chars().count().min(area.width as usize) as u16);
+
+        let chunks = Layout::new(
+            Direction::Horizontal,
+            [Constraint::Min(0), Constraint::Length(right_width)],
+        )
+        .split(area);
+
         if let Some(err) = &self.error {
             let line = Line::from(vec![
                 Span::styled(
@@ -64,35 +87,45 @@ impl Widget for &ProjectionStatus {
                 ),
                 Span::styled(format!(" {err}"), Style::default().fg(Color::Red)),
             ]);
-            Paragraph::new(line).render(area, buf);
-            return;
+            Paragraph::new(line).render(chunks[0], buf);
+        } else {
+            let (badge, badge_style, hint) = match self.mode {
+                Mode::Interacting => (
+                    " INTERACTING ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                    " Ctrl+Space: manage",
+                ),
+                Mode::Managing => (
+                    " MANAGING ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | s: scopes | r: rename | q: detach",
+                ),
+            };
+
+            let line = Line::from(vec![
+                Span::styled(badge, badge_style),
+                Span::styled(hint, Style::default().fg(Color::Gray)),
+            ]);
+
+            Paragraph::new(line).render(chunks[0], buf);
         }
 
-        let (badge, badge_style, hint) = match self.mode {
-            Mode::Interacting => (
-                " INTERACTING ",
+        if let Some(label) = scope_label {
+            Paragraph::new(Span::styled(
+                label,
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Green)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-                " Ctrl+Space: manage",
-            ),
-            Mode::Managing => (
-                " MANAGING ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | s: scopes | q: detach",
-            ),
-        };
-
-        let line = Line::from(vec![
-            Span::styled(badge, badge_style),
-            Span::styled(hint, Style::default().fg(Color::Gray)),
-        ]);
-
-        Paragraph::new(line).render(area, buf);
+            ))
+            .render(chunks[1], buf);
+        }
     }
 }
 

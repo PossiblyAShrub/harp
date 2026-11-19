@@ -546,14 +546,19 @@ impl Scope {
         self.layout_revision.wrapping_add(terms)
     }
 
+    pub fn bump_revision(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+    }
+
     pub fn leaf_count(&self) -> usize {
         self.root.as_ref().map_or(0, TileNode::leaf_count)
     }
 
-    pub fn snapshot(&self, scope_id: u64) -> Option<ScopeSnapshot> {
+    pub fn snapshot(&self, scope_id: u64, scope_name: String) -> Option<ScopeSnapshot> {
         let root = self.root.as_ref()?.to_snapshot()?;
         Some(ScopeSnapshot {
             scope_id,
+            scope_name,
             revision: self.revision(),
             focused_id: self.focused_id,
             root,

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Buffer,
@@ -143,10 +143,135 @@ impl Widget for &ScopeSwitcher {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RenameAction {
+    None,
+    Cancel,
+    Confirm(String),
+}
+
+pub struct RenameModal {
+    name: String,
+    cursor: usize,
+}
+
+impl RenameModal {
+    pub fn new(current_name: impl Into<String>) -> Self {
+        let name = current_name.into();
+        let cursor = name.chars().count();
+        Self { name, cursor }
+    }
+
+    pub fn handle_key(&mut self, key_event: KeyEvent) -> RenameAction {
+        if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return RenameAction::None;
+        }
+
+        match key_event.code {
+            KeyCode::Esc => return RenameAction::Cancel,
+            KeyCode::Enter => {
+                let trimmed = self.name.trim();
+                if trimmed.is_empty() {
+                    return RenameAction::Cancel;
+                }
+                return RenameAction::Confirm(trimmed.to_string());
+            }
+            KeyCode::Char(c) if !key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                let idx = char_to_byte_index(&self.name, self.cursor);
+                self.name.insert(idx, c);
+                self.cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                    let idx = char_to_byte_index(&self.name, self.cursor);
+                    self.name.remove(idx);
+                }
+            }
+            KeyCode::Delete => {
+                let len = self.name.chars().count();
+                if self.cursor < len {
+                    let idx = char_to_byte_index(&self.name, self.cursor);
+                    self.name.remove(idx);
+                }
+            }
+            KeyCode::Left => {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let len = self.name.chars().count();
+                if self.cursor < len {
+                    self.cursor += 1;
+                }
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.name.chars().count(),
+            _ => {}
+        }
+
+        RenameAction::None
+    }
+}
+
+impl Widget for &RenameModal {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let popup_width = area.width.saturating_sub(4).min(52).max(24);
+        let popup_height = 6u16.min(area.height.saturating_sub(2)).max(5);
+        let x = area.x + area.width.saturating_sub(popup_width) / 2;
+        let y = area.y + area.height.saturating_sub(popup_height) / 2;
+        let popup = Rect::new(x, y, popup_width.min(area.width), popup_height.min(area.height));
+
+        Clear.render(popup, buf);
+
+        let outer = Block::bordered().title(" Rename Scope ");
+        let inner = outer.inner(popup);
+        outer.render(popup, buf);
+
+        let chunks = Layout::new(
+            Direction::Vertical,
+            [Constraint::Length(3), Constraint::Length(1)],
+        )
+        .split(inner);
+
+        let input_block = Block::bordered().border_style(Style::default().fg(Color::Yellow));
+        let input_inner = input_block.inner(chunks[0]);
+        input_block.render(chunks[0], buf);
+
+        let byte_idx = char_to_byte_index(&self.name, self.cursor);
+        let before = &self.name[..byte_idx];
+        let (cursor_ch, after) = if byte_idx < self.name.len() {
+            let ch = self.name[byte_idx..].chars().next().unwrap();
+            (ch.to_string(), &self.name[byte_idx + ch.len_utf8()..])
+        } else {
+            (" ".to_string(), "")
+        };
+        Paragraph::new(Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                cursor_ch,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ),
+            Span::raw(after),
+        ]))
+        .render(input_inner, buf);
+
+        Paragraph::new(Span::styled(
+            "Enter: save | Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .render(chunks[1], buf);
+    }
+}
+
+fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map_or(s.len(), |(idx, _)| idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     use std::path::PathBuf;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -172,5 +297,21 @@ mod tests {
             SwitcherAction::CreateNew
         );
         assert_eq!(switcher.handle_key(key(KeyCode::Esc)), SwitcherAction::Cancel);
+    }
+
+    #[test]
+    fn rename_modal_edits_and_confirms() {
+        let mut modal = RenameModal::new("old");
+        modal.handle_key(key(KeyCode::Backspace));
+        modal.handle_key(key(KeyCode::Backspace));
+        modal.handle_key(key(KeyCode::Backspace));
+        for ch in "backend".chars() {
+            modal.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(
+            modal.handle_key(key(KeyCode::Enter)),
+            RenameAction::Confirm("backend".to_string())
+        );
+        assert_eq!(modal.handle_key(key(KeyCode::Esc)), RenameAction::Cancel);
     }
 }

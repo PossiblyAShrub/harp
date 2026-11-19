@@ -55,6 +55,7 @@ pub enum SnapshotNode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScopeSnapshot {
     pub scope_id: u64,
+    pub scope_name: String,
     pub revision: u64,
     pub focused_id: usize,
     pub root: SnapshotNode,
@@ -72,6 +73,10 @@ pub enum ClientMsg {
         scope_id: u64,
         cols: u16,
         rows: u16,
+    },
+    RenameScope {
+        scope_id: u64,
+        name: String,
     },
     Poll {
         scope_id: u64,
