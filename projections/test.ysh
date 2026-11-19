@@ -1,0 +1,25 @@
+#!/usr/bin/env ysh
+
+while true {
+  try {
+    cargo test
+  }
+
+  echo ""
+  echo "[r] rerun tests | [e] exit"
+
+  while true {
+    try {
+      read --num-bytes 1 (&ch)
+    }
+    if (_error.code !== 0) {
+      exit 0
+    }
+    if (ch === 'e') {
+      exit 0
+    }
+    if (ch === 'r') {
+      break
+    }
+  }
+}

@@ -1,0 +1,209 @@
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramOption {
+    pub label: String,
+    pub program: String,
+}
+
+pub fn default_programs() -> Vec<ProgramOption> {
+    vec![
+        ProgramOption {
+            label: "ZSH".to_string(),
+            program: "zsh".to_string(),
+        },
+        ProgramOption {
+            label: "Neovim".to_string(),
+            program: "/home/aolse/.asdf/shims/nvim".to_string(),
+        },
+        ProgramOption {
+            label: "lazygit".to_string(),
+            program: "lazygit".to_string(),
+        },
+    ]
+}
+
+pub fn default_harp_config_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("harp"))
+}
+
+pub fn parse_harp_file(contents: &str) -> Vec<ProgramOption> {
+    let mut programs = Vec::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+
+        let split = line
+            .split_once('=')
+            .or_else(|| line.split_once(':'));
+
+        let (label, program) = match split {
+            Some((left, right)) => (left.trim(), strip_quotes(right.trim())),
+            None => (line, line),
+        };
+
+        if !label.is_empty() && !program.is_empty() {
+            programs.push(ProgramOption {
+                label: label.to_string(),
+                program: program.to_string(),
+            });
+        }
+    }
+
+    programs
+}
+
+fn strip_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption> {
+    let mut files = Vec::new();
+
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(".harp");
+        if candidate.is_file() {
+            files.push(candidate);
+        }
+    }
+
+    if let Some(dir) = config_dir {
+        if let Ok(entries) = fs::read_dir(dir) {
+            let mut global_files: Vec<PathBuf> = entries
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "harp"))
+                .collect();
+            global_files.sort();
+            files.extend(global_files);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for file in files {
+        if let Ok(contents) = fs::read_to_string(&file) {
+            for opt in parse_harp_file(&contents) {
+                if seen.insert(opt.label.clone()) {
+                    result.push(opt);
+                }
+            }
+        }
+    }
+
+    if result.is_empty() {
+        default_programs()
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("harp_test_{name}_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parses_harp_file_lines() {
+        let content = r#"
+            # Comment
+            // Another comment
+
+            ZSH = zsh
+            Neovim: "/home/aolse/.asdf/shims/nvim"
+            lazygit = 'lazygit'
+            htop
+        "#;
+        let parsed = parse_harp_file(content);
+        assert_eq!(
+            parsed,
+            vec![
+                ProgramOption {
+                    label: "ZSH".to_string(),
+                    program: "zsh".to_string(),
+                },
+                ProgramOption {
+                    label: "Neovim".to_string(),
+                    program: "/home/aolse/.asdf/shims/nvim".to_string(),
+                },
+                ProgramOption {
+                    label: "lazygit".to_string(),
+                    program: "lazygit".to_string(),
+                },
+                ProgramOption {
+                    label: "htop".to_string(),
+                    program: "htop".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_nested_and_global_harp_files_with_precedence() {
+        let root = temp_dir("nested");
+        let child = root.join("project").join("sub");
+        let global = root.join("global_config");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&global).unwrap();
+
+        fs::write(root.join(".harp"), "Editor = vim\nShell = bash\n").unwrap();
+        fs::write(
+            child.join(".harp"),
+            "Editor = /home/aolse/.asdf/shims/nvim\n",
+        )
+        .unwrap();
+        fs::write(global.join("01-base.harp"), "Git = lazygit\nShell = zsh\n").unwrap();
+
+        let loaded = load_programs(&child, Some(&global));
+        assert_eq!(
+            loaded,
+            vec![
+                ProgramOption {
+                    label: "Editor".to_string(),
+                    program: "/home/aolse/.asdf/shims/nvim".to_string(),
+                },
+                ProgramOption {
+                    label: "Shell".to_string(),
+                    program: "bash".to_string(),
+                },
+                ProgramOption {
+                    label: "Git".to_string(),
+                    program: "lazygit".to_string(),
+                },
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn falls_back_to_defaults_when_no_harp_files_exist() {
+        let root = temp_dir("empty");
+        let loaded = load_programs(&root, Some(&root.join("missing")));
+        assert_eq!(loaded, default_programs());
+        let _ = fs::remove_dir_all(&root);
+    }
+}

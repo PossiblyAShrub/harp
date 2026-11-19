@@ -9,6 +9,7 @@ use ratatui::{
     widgets::Widget,
 };
 
+mod config;
 mod picker;
 mod projections;
 mod scopes;

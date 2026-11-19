@@ -1,0 +1,5 @@
+# Example .harp configuration for this repository
+Neovim = nvim
+lazygit = lazygit
+ZSH = zsh
+Cargo Test = projections/test.ysh

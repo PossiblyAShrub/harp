@@ -9,27 +9,10 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph, Widget},
 };
 
-use crate::scopes::{NavDirection, ScopeSpec};
-
-pub struct ProgramOption {
-    pub label: &'static str,
-    pub program: &'static str,
-}
-
-pub const DEFAULT_PROGRAMS: &[ProgramOption] = &[
-    ProgramOption {
-        label: "ZSH",
-        program: "zsh",
-    },
-    ProgramOption {
-        label: "Neovim",
-        program: "/home/aolse/.asdf/shims/nvim",
-    },
-    ProgramOption {
-        label: "lazygit",
-        program: "lazygit",
-    },
-];
+use crate::{
+    config::{ProgramOption, default_harp_config_dir, load_programs},
+    scopes::{NavDirection, ScopeSpec},
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum PickerField {
@@ -50,6 +33,7 @@ pub enum PickerAction {
 pub struct ScopePicker {
     direction: NavDirection,
     field: PickerField,
+    programs: Vec<ProgramOption>,
     selected_program: usize,
     cwd: String,
     cursor: usize,
@@ -57,11 +41,21 @@ pub struct ScopePicker {
 
 impl ScopePicker {
     pub fn new(direction: NavDirection, default_cwd: PathBuf) -> Self {
+        let programs = load_programs(&default_cwd, default_harp_config_dir().as_deref());
+        Self::with_programs(direction, default_cwd, programs)
+    }
+
+    pub fn with_programs(
+        direction: NavDirection,
+        default_cwd: PathBuf,
+        programs: Vec<ProgramOption>,
+    ) -> Self {
         let cwd = default_cwd.to_string_lossy().into_owned();
         let cursor = cwd.chars().count();
         Self {
             direction,
             field: PickerField::Program,
+            programs,
             selected_program: 0,
             cwd,
             cursor,
@@ -69,7 +63,11 @@ impl ScopePicker {
     }
 
     pub fn spec(&self) -> ScopeSpec {
-        let program = DEFAULT_PROGRAMS[self.selected_program].program.to_string();
+        let program = self
+            .programs
+            .get(self.selected_program)
+            .map(|p| p.program.clone())
+            .unwrap_or_else(|| "zsh".to_string());
         let cwd = if self.cwd.trim().is_empty() {
             PathBuf::from("/")
         } else {
@@ -112,7 +110,7 @@ impl ScopePicker {
                     self.selected_program = self.selected_program.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.selected_program + 1 < DEFAULT_PROGRAMS.len() {
+                    if self.selected_program + 1 < self.programs.len() {
                         self.selected_program += 1;
                     }
                 }
@@ -163,8 +161,10 @@ impl ScopePicker {
 
 impl Widget for &ScopePicker {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let list_rows = self.programs.len().max(1) as u16 + 2;
+        let desired_height = 1 + list_rows + 3 + 1 + 2;
         let popup_width = area.width.saturating_sub(4).min(64).max(24);
-        let popup_height = area.height.saturating_sub(2).min(13).max(9);
+        let popup_height = area.height.saturating_sub(2).min(desired_height).max(9);
         let popup = centered_rect(popup_width, popup_height, area);
 
         Clear.render(popup, buf);
@@ -183,7 +183,7 @@ impl Widget for &ScopePicker {
             Direction::Vertical,
             [
                 Constraint::Length(1),
-                Constraint::Length(DEFAULT_PROGRAMS.len() as u16 + 2),
+                Constraint::Min(3),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ],
@@ -201,7 +201,8 @@ impl Widget for &ScopePicker {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let items: Vec<ListItem> = DEFAULT_PROGRAMS
+        let items: Vec<ListItem> = self
+            .programs
             .iter()
             .enumerate()
             .map(|(i, opt)| {
@@ -287,7 +288,11 @@ mod tests {
 
     #[test]
     fn picker_selects_program_and_edits_cwd() {
-        let mut picker = ScopePicker::new(NavDirection::Right, PathBuf::from("/tmp/work"));
+        let mut picker = ScopePicker::with_programs(
+            NavDirection::Right,
+            PathBuf::from("/tmp/work"),
+            crate::config::default_programs(),
+        );
         assert_eq!(picker.spec().program, "zsh");
         assert_eq!(picker.spec().machine, "localhost");
         assert_eq!(picker.spec().cwd, PathBuf::from("/tmp/work"));
