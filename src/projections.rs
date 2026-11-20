@@ -287,7 +287,7 @@ impl ProjectionTerm {
         self.revision.load(Ordering::Acquire)
     }
 
-    pub fn state_snapshot(&self) -> (u16, u16, Vec<u8>, Vec<u8>) {
+    pub fn state_snapshot(&self) -> (u16, u16, Vec<u8>, Vec<u8>, bool) {
         let mut parser = self.parser.lock().unwrap();
         let (rows, cols) = parser.screen().size();
         let state = parser.screen().state_formatted();
@@ -308,7 +308,8 @@ impl ProjectionTerm {
             }
         };
 
-        (cols, rows, state, scrollback)
+        let alternate_screen = parser.screen().alternate_screen();
+        (cols, rows, state, scrollback, alternate_screen)
     }
 
     pub fn handle_event(&mut self, event: &Event) -> io::Result<()> {
@@ -1272,8 +1273,8 @@ mod tests {
     fn scrollback_snapshot_skips_resending_unchanged_history() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new("/").to_path_buf());
         let term = ProjectionTerm::with_command(20, 4, "true", &cwd).unwrap();
-        let (_, _, _, first) = term.state_snapshot();
-        let (_, _, _, second) = term.state_snapshot();
+        let (_, _, _, first, _) = term.state_snapshot();
+        let (_, _, _, second, _) = term.state_snapshot();
         // "true" writes nothing, but the first snapshot still pads the
         // (empty) history; the second must report no change.
         assert!(!first.is_empty());
@@ -1428,7 +1429,7 @@ printf 'RESP:%s\n' "$r"
         // The cell-size query must have been answered back into the pty: the
         // child's read loop only finishes once it sees a response ending in
         // 't', and it then prints RESP:.
-        let (_, _, state, _) = term.state_snapshot();
+        let (_, _, state, _, _) = term.state_snapshot();
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(&state);
         let contents = parser.screen().contents();

@@ -144,6 +144,7 @@ mod tests {
             rows: 10,
             state: Vec::new(),
             scrollback: Vec::new(),
+            alternate_screen: false,
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
                     rows: 10,
                     state: Vec::new(),
                     scrollback: Vec::new(),
+                    alternate_screen: false,
                 },
                 TabPageSnapshot {
                     id: 2,
@@ -200,6 +202,7 @@ mod tests {
                     rows: 10,
                     state: Vec::new(),
                     scrollback: Vec::new(),
+                    alternate_screen: false,
                 },
             ],
             active: 1,

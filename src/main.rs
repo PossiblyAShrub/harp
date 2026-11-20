@@ -144,6 +144,7 @@ impl App {
                 rows,
                 state,
                 scrollback,
+                alternate_screen: _,
             } => {
                 active_ids.push(*id);
                 self.upsert_parser(*id, *cols, *rows, state, scrollback);
@@ -336,9 +337,10 @@ impl App {
     /// True when a projection is on its alternate screen (vim, less, ...),
     /// where there is no scrollback and scrolling is left to the program.
     fn pane_in_alternate_screen(&self, id: usize) -> bool {
-        self.parsers
-            .get(&id)
-            .is_some_and(|p| p.screen().alternate_screen())
+        self.snapshot
+            .as_ref()
+            .and_then(|snap| snapshot_alternate_screen(&snap.root, id))
+            .unwrap_or(false)
     }
 
     /// Scrolls `id`'s view by `delta` rows. Offset 0 is the bottom of the
@@ -639,16 +641,16 @@ impl App {
                         {
                             let focused = self.snapshot.as_ref().map(|s| s.focused_id);
                             if let Some(id) = focused
-                                && !self.pane_in_alternate_screen(id)
+                                && self.pane_in_alternate_screen(id)
                             {
+                                self.forward_event(event)?;
+                            } else if let Some(id) = focused {
                                 let dir = if key_event.code == KeyCode::PageUp {
                                     1
                                 } else {
                                     -1
                                 };
                                 self.scroll_pane_page(id, dir);
-                            } else {
-                                self.forward_event(event)?;
                             }
                         }
                         _ => {
@@ -684,15 +686,17 @@ impl App {
                                 && key_event.modifiers == KeyModifiers::NONE
                             {
                                 let focused = self.snapshot.as_ref().map(|s| s.focused_id);
-                                if let Some(id) = focused
-                                    && !self.pane_in_alternate_screen(id)
-                                {
-                                    let dir = if key_event.code == KeyCode::PageUp {
-                                        1
+                                if let Some(id) = focused {
+                                    if self.pane_in_alternate_screen(id) {
+                                        self.forward_event(event)?;
                                     } else {
-                                        -1
-                                    };
-                                    self.scroll_pane_page(id, dir);
+                                        let dir = if key_event.code == KeyCode::PageUp {
+                                            1
+                                        } else {
+                                            -1
+                                        };
+                                        self.scroll_pane_page(id, dir);
+                                    }
                                 }
                             } else if key_event.code == KeyCode::Enter
                                 && !key_event
@@ -842,6 +846,23 @@ fn total_scrollback(parser: &mut vt100::Parser) -> usize {
     let total = parser.screen().scrollback();
     parser.screen_mut().set_scrollback(0);
     total
+}
+
+fn snapshot_alternate_screen(node: &SnapshotNode, id: usize) -> Option<bool> {
+    match node {
+        SnapshotNode::Leaf {
+            id: leaf_id,
+            alternate_screen,
+            ..
+        } => (*leaf_id == id).then_some(*alternate_screen),
+        SnapshotNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| snapshot_alternate_screen(&child.node, id)),
+        SnapshotNode::Tabs { pages, .. } => pages
+            .iter()
+            .find(|page| page.id == id)
+            .map(|page| page.alternate_screen),
+    }
 }
 
 /// Queries the real terminal for its character cell size in pixels via
@@ -1032,6 +1053,7 @@ mod tests {
             rows: 10,
             state: state.to_vec(),
             scrollback: Vec::new(),
+            alternate_screen: false,
         };
         assert!(
             root_has_raw_state(&root, &|s: &[u8]| slice_contains(s, b"\x1b[?1;2c")),

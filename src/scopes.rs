@@ -280,13 +280,14 @@ impl TileNode {
         match self {
             TileNode::Leaf { id, projection } => {
                 let Projection::Term(term) = projection;
-                let (cols, rows, state, scrollback) = term.state_snapshot();
+                let (cols, rows, state, scrollback, alternate_screen) = term.state_snapshot();
                 Some(SnapshotNode::Leaf {
                     id: *id,
                     cols,
                     rows,
                     state,
                     scrollback,
+                    alternate_screen,
                 })
             }
             TileNode::Split {
@@ -323,7 +324,8 @@ impl TileNode {
                     .iter()
                     .map(|page| {
                         let Projection::Term(term) = &page.projection;
-                        let (cols, rows, state, scrollback) = term.state_snapshot();
+                        let (cols, rows, state, scrollback, alternate_screen) =
+                            term.state_snapshot();
                         crate::protocol::TabPageSnapshot {
                             id: page.id,
                             name: term.title(),
@@ -331,6 +333,7 @@ impl TileNode {
                             rows,
                             state,
                             scrollback,
+                            alternate_screen,
                         }
                     })
                     .collect();
