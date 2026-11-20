@@ -237,3 +237,7 @@ quality. Many routines lack the sort of beauty and surprise that would generally
 appear in that of a skilled programmer. The unfortunate reality, however, is
 that this quality is sufficient for most if not all real problems. This may be why
 LLMs have learnt to allocate little reasoning beyond the mean when producing code.
+
+## License
+
+See [`LICENSE`](./LICENSE).
