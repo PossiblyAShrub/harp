@@ -383,10 +383,14 @@ fn encode_key_event(key_event: KeyEvent, application_cursor: bool) -> Option<Vec
             out.push(if ctrl { 0x08 } else { 0x7f });
         }
         KeyCode::Enter => {
-            if alt {
-                out.push(0x1b);
+            if let Some(m) = xterm_modifier(modifiers) {
+                // Modified Enter (Shift/Ctrl/Alt+Enter) has no legacy
+                // encoding; report it as a generic CSI-u key so programs that
+                // understand the extended keyboard protocol see the modifier.
+                out.extend_from_slice(format!("\x1b[13;{m}u").as_bytes());
+            } else {
+                out.push(b'\r');
             }
-            out.push(b'\r');
         }
         KeyCode::Tab => {
             if shift {
@@ -673,7 +677,18 @@ mod tests {
         );
         assert_eq!(
             encode_key_event(key(KeyCode::Enter, KeyModifiers::ALT), false),
-            Some(b"\x1b\r".to_vec())
+            Some(b"\x1b[13;3u".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(key(KeyCode::Enter, KeyModifiers::SHIFT), false),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            encode_key_event(
+                key(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                false
+            ),
+            Some(b"\x1b[13;6u".to_vec())
         );
         assert_eq!(
             encode_key_event(key(KeyCode::Backspace, KeyModifiers::NONE), false),
