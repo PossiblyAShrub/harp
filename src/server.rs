@@ -78,7 +78,7 @@ impl ServerState {
             ClientMsg::CreateScope { cwd, cols, rows } => {
                 let id = self.next_id;
                 let area = Rect::new(0, 0, cols.max(1), rows.max(1));
-                match Scope::with_terminals_in(2, Direction::Horizontal, area, &cwd) {
+                match Scope::with_terminals_in(1, Direction::Horizontal, area, &cwd) {
                     Ok(scope) => {
                         self.next_id += 1;
                         let name = cwd
