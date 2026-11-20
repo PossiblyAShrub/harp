@@ -208,6 +208,7 @@ mod tests {
                 ProgramOption::new("Editor", "/home/aolse/.asdf/shims/nvim"),
                 ProgramOption::new("Shell", "bash"),
                 ProgramOption::new("Git", "lazygit"),
+                ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
             ]
         );
 
@@ -250,6 +251,7 @@ mod tests {
                 },
                 ProgramOption::new("Shell", "zsh"),
                 ProgramOption::new("Abs", "/usr/bin/env"),
+                ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
             ]
         );
 
