@@ -107,7 +107,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: projection | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
+                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: projection | Alt+Arrows: tabs | Ctrl+Alt+Arrows: move | drag top border or tab | Shift+drop: tab | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
                 ),
             };
 

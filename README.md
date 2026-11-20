@@ -72,6 +72,18 @@ your client while a scope continues in the background.
 Projections are individual applications that live in a scope. They may be a
 terminal, an editor, or a custom tool that belongs to a workspace.
 
+### Rearranging projections
+
+In managing mode, click a tab to activate it. Drag a pane by its top border,
+or drag a tab by its label. Drag the exposed top border beside the labels
+to move the whole tab stack.
+
+Drop near an edge to split in that direction, or over a tab label to insert
+before or after it. Dropping in the center swaps projections or merges a
+whole stack into the destination's tabs. Hold Shift to add as tabs from
+anywhere in the destination. Press Esc to cancel a drag, or use
+`Ctrl+Alt+Arrow` to swap the focused projection with its neighbor.
+
 ### `.harp` Configuration
 
 Launcher programs are discovered from `.harp` files in the following order

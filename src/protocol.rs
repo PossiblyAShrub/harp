@@ -25,6 +25,23 @@ pub enum TabDir {
     Prev,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DropAction {
+    Swap,
+    Tab,
+    TabBefore,
+    SplitHorizontal,
+    SplitHorizontalBefore,
+    SplitVertical,
+    SplitVerticalBefore,
+}
+
+impl DropAction {
+    pub fn is_split(self) -> bool {
+        !matches!(self, Self::Swap | Self::Tab | Self::TabBefore)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteScopeSpec {
     pub machine: String,
@@ -149,6 +166,21 @@ pub enum ClientMsg {
     MoveFocus {
         scope_id: u64,
         dir: NavDir,
+    },
+    DropProjection {
+        scope_id: u64,
+        source_id: usize,
+        target_id: usize,
+        action: DropAction,
+        whole_stack: bool,
+    },
+    MoveProjection {
+        scope_id: u64,
+        dir: NavDir,
+    },
+    ActivateProjection {
+        scope_id: u64,
+        projection_id: usize,
     },
     Split {
         scope_id: u64,

@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs::File,
-    io::Write,
+    io::{self, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -124,6 +124,24 @@ impl ServerState {
 
     fn find_mut(&mut self, scope_id: u64) -> Option<&mut ServerScope> {
         self.scopes.iter_mut().find(|s| s.id == scope_id)
+    }
+
+    fn change_layout(
+        &mut self,
+        scope_id: u64,
+        change: impl FnOnce(&mut Scope) -> io::Result<bool>,
+    ) -> ServerMsg {
+        let Some(entry) = self.find_mut(scope_id) else {
+            return ServerMsg::ScopeClosed;
+        };
+        match change(&mut entry.scope) {
+            Ok(true) => entry
+                .scope
+                .snapshot(scope_id, entry.name.clone())
+                .map_or(ServerMsg::ScopeClosed, ServerMsg::Snapshot),
+            Ok(false) => ServerMsg::Unchanged,
+            Err(err) => ServerMsg::Error(err.to_string()),
+        }
     }
 
     fn handle_msg(&mut self, msg: ClientMsg) -> ServerMsg {
@@ -315,6 +333,24 @@ impl ServerState {
                     None => ServerMsg::ScopeClosed,
                 }
             }
+            ClientMsg::DropProjection {
+                scope_id,
+                source_id,
+                target_id,
+                action,
+                whole_stack,
+            } => self.change_layout(scope_id, |scope| {
+                scope.drop_projection(source_id, target_id, action, whole_stack)
+            }),
+            ClientMsg::MoveProjection { scope_id, dir } => {
+                self.change_layout(scope_id, |scope| scope.move_projection(to_nav_dir(dir)))
+            }
+            ClientMsg::ActivateProjection {
+                scope_id,
+                projection_id,
+            } => self.change_layout(scope_id, |scope| {
+                Ok(scope.activate_projection(projection_id))
+            }),
             ClientMsg::Split {
                 scope_id,
                 dir,

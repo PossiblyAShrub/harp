@@ -9,8 +9,9 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::{
@@ -26,6 +27,7 @@ mod config;
 mod copymode;
 mod crypto;
 mod debug;
+mod drag;
 mod picker;
 mod projections;
 mod protocol;
@@ -35,8 +37,7 @@ mod switcher;
 mod view;
 
 use copymode::{CopyAction, CopyMode};
-#[cfg(test)]
-use crypto::EncryptedStream;
+use drag::Drag;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus, SCROLLBACK_LINES};
 use protocol::{
@@ -58,6 +59,7 @@ struct App {
     switcher: Option<ScopeSwitcher>,
     rename: Option<RenameModal>,
     copy_mode: Option<CopyMode>,
+    drag: Option<Drag>,
     /// Per-projection scrollback view offset (rows above the bottom).
     scroll: HashMap<usize, usize>,
     /// Previous local left click, used to recognize a double-click.
@@ -89,6 +91,7 @@ impl App {
             switcher: None,
             rename: None,
             copy_mode: None,
+            drag: None,
             scroll: HashMap::new(),
             last_click: None,
             pending_q: None,
@@ -113,11 +116,73 @@ impl App {
     }
 
     fn set_mode(&mut self, mode: Mode) {
+        self.cancel_drag();
         self.mode = mode;
         self.status.set_mode(mode);
     }
 
+    fn cancel_drag(&mut self) {
+        if let Some(drag) = &mut self.drag {
+            drag.cancel();
+        }
+    }
+
+    fn handle_layout_mouse(&mut self, mouse: MouseEvent) -> io::Result<bool> {
+        let Some(snap) = &self.snapshot else {
+            return Ok(false);
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = Drag::start(snap, self.workspace_area, mouse);
+                if self.drag.is_some() {
+                    self.copy_mode = None;
+                    self.last_click = None;
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if let Some(drag) = &mut self.drag => {
+                drag.track(mouse);
+                return Ok(true);
+            }
+            MouseEventKind::Up(MouseButton::Left) if let Some(drag) = self.drag.take() => {
+                if drag.scope_id() != snap.scope_id {
+                    return Ok(true);
+                }
+                let message =
+                    if let Some(destination) = drag.destination(snap, self.workspace_area, mouse) {
+                        ClientMsg::DropProjection {
+                            scope_id: snap.scope_id,
+                            source_id: drag.source(),
+                            target_id: destination.target,
+                            action: destination.action,
+                            whole_stack: drag.whole_stack(),
+                        }
+                    } else if drag.is_click(mouse) {
+                        ClientMsg::ActivateProjection {
+                            scope_id: snap.scope_id,
+                            projection_id: drag.source(),
+                        }
+                    } else {
+                        return Ok(true);
+                    };
+                self.client.send(&message)?;
+                let reply = self.client.recv::<ServerMsg>()?;
+                self.handle_server_reply(reply)?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn apply_snapshot(&mut self, snap: ScopeSnapshot) {
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.scope_id() != snap.scope_id)
+        {
+            self.cancel_drag();
+        }
         // Offsets are measured from the bottom. When new output adds rows to
         // history, increase a scrolled-up pane's offset by the same amount so
         // its current content stays anchored instead of drifting toward the
@@ -233,6 +298,7 @@ impl App {
             ServerMsg::Unchanged => {}
             ServerMsg::Ok => {}
             ServerMsg::ScopeClosed => {
+                self.cancel_drag();
                 self.snapshot = None;
                 self.status.set_scope_name(None);
                 self.copy_mode = None;
@@ -253,6 +319,7 @@ impl App {
                 self.status.set_error(Some(e));
             }
             ServerMsg::Scopes(scopes) => {
+                self.cancel_drag();
                 self.snapshot = None;
                 self.parsers.clear();
                 self.scroll.clear();
@@ -672,8 +739,43 @@ impl App {
     fn handle_events(&mut self) -> io::Result<()> {
         loop {
             let event = event::read()?;
+            if matches!(event, Event::Resize(..) | Event::Paste(_))
+                || matches!(event, Event::Key(KeyEvent { kind: KeyEventKind::Press, code, .. })
+                    if !matches!(code, KeyCode::Modifier(_)))
+            {
+                self.cancel_drag();
+            }
 
-            if self.handle_q_gesture(&event)? {
+            if let Event::Key(KeyEvent {
+                code: KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift),
+                kind,
+                ..
+            }) = event
+                && let Some(drag) = &mut self.drag
+            {
+                drag.set_shift(kind != KeyEventKind::Release);
+            }
+
+            let suppress_mouse = if let Event::Mouse(mouse) = &event
+                && self.drag.as_ref().is_some_and(Drag::is_cancelled)
+            {
+                match mouse.kind {
+                    MouseEventKind::Drag(MouseButton::Left) => true,
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        self.drag = None;
+                        true
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.drag = None;
+                        false
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if suppress_mouse || self.handle_q_gesture(&event)? {
                 if self.exit || !event::poll(Duration::ZERO)? {
                     break;
                 }
@@ -790,6 +892,11 @@ impl App {
                         }
                     }
                 }
+            } else if let Event::Mouse(mouse) = &event
+                && self.mode == Mode::Managing
+                && self.handle_layout_mouse(*mouse)?
+            {
+                // A layout gesture owns the mouse from press to release.
             } else if let Event::Mouse(mouse) = &event
                 && self.start_mouse_selection(*mouse)
             {
@@ -944,7 +1051,18 @@ impl App {
                                     self.handle_server_reply(reply)?;
                                 }
                             } else if let Some(dir) = arrow_direction(key_event.code) {
-                                if key_event.modifiers.contains(KeyModifiers::ALT) {
+                                if key_event.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key_event.modifiers.contains(KeyModifiers::ALT)
+                                {
+                                    if let Some(snap) = &self.snapshot {
+                                        self.client.send(&ClientMsg::MoveProjection {
+                                            scope_id: snap.scope_id,
+                                            dir: to_nav_dir(dir),
+                                        })?;
+                                        let reply = self.client.recv::<ServerMsg>()?;
+                                        self.handle_server_reply(reply)?;
+                                    }
+                                } else if key_event.modifiers.contains(KeyModifiers::ALT) {
                                     if let Some(snap) = &self.snapshot {
                                         let tab_dir = match dir {
                                             NavDirection::Left | NavDirection::Up => TabDir::Prev,
@@ -1021,6 +1139,9 @@ impl Widget for &App {
             SnapshotView::new(snap, &self.parsers, &trace).render(chunks[0], buf);
         }
         self.status.render(chunks[1], buf);
+        if let (Some(drag), Some(snap)) = (&self.drag, &self.snapshot) {
+            drag.render(snap, chunks[0], chunks[1], buf);
+        }
 
         if let Some(copy_mode) = &self.copy_mode {
             if copy_mode.is_mouse_selection() {

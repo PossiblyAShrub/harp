@@ -12,7 +12,9 @@ use ratatui::{
 
 use crate::{
     projections::ProjectionTerm,
-    protocol::{DEBUG_PROJECTION_PROGRAM, ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
+    protocol::{
+        DEBUG_PROJECTION_PROGRAM, DropAction, ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +150,15 @@ struct TabPage {
     projection: Projection,
 }
 
+impl TabPage {
+    fn into_leaf(self) -> TileNode {
+        TileNode::Leaf {
+            id: self.id,
+            projection: self.projection,
+        }
+    }
+}
+
 enum TileNode {
     Leaf {
         id: usize,
@@ -164,6 +175,192 @@ enum TileNode {
 }
 
 impl TileNode {
+    fn pane(&self, id: usize) -> Option<&Self> {
+        match self {
+            Self::Leaf { id: leaf_id, .. } => (*leaf_id == id).then_some(self),
+            Self::Tabs { pages, .. } => pages.iter().any(|page| page.id == id).then_some(self),
+            Self::Split { children, .. } => children.iter().find_map(|child| child.node.pane(id)),
+        }
+    }
+
+    fn extract(self, id: usize, whole_stack: bool) -> (Option<Self>, Option<Self>) {
+        match self {
+            node @ Self::Leaf { id: leaf_id, .. } if leaf_id == id && !whole_stack => {
+                (None, Some(node))
+            }
+            Self::Tabs { mut pages, active } => {
+                let Some(index) = pages.iter().position(|page| page.id == id) else {
+                    return (Some(Self::Tabs { pages, active }), None);
+                };
+                if whole_stack {
+                    return (None, Some(Self::Tabs { pages, active }));
+                }
+
+                let moving = pages.remove(index).into_leaf();
+                let remainder = match pages.len() {
+                    0 => None,
+                    1 => pages.pop().map(TabPage::into_leaf),
+                    _ => {
+                        let active = (active - usize::from(index < active)).min(pages.len() - 1);
+                        Some(Self::Tabs { pages, active })
+                    }
+                };
+                (remainder, Some(moving))
+            }
+            Self::Split {
+                direction,
+                mut children,
+            } => {
+                let Some(index) = children
+                    .iter()
+                    .position(|child| child.node.pane(id).is_some())
+                else {
+                    return (
+                        Some(Self::Split {
+                            direction,
+                            children,
+                        }),
+                        None,
+                    );
+                };
+                let TileChild { constraint, node } = children.remove(index);
+                let (remainder, moving) = node.extract(id, whole_stack);
+                if let Some(node) = remainder {
+                    children.insert(index, TileChild { constraint, node });
+                }
+                let remainder = if moving.is_some() && children.len() == 1 {
+                    children.pop().map(|child| child.node)
+                } else {
+                    Some(Self::Split {
+                        direction,
+                        children,
+                    })
+                };
+                (remainder, moving)
+            }
+            node => (Some(node), None),
+        }
+    }
+
+    fn insert_drop(&mut self, target: usize, moving: Self, action: DropAction) {
+        if let Self::Split { children, .. } = self {
+            let child = children
+                .iter_mut()
+                .find(|child| child.node.pane(target).is_some())
+                .expect("validated drop target");
+            child.node.insert_drop(target, moving, action);
+            return;
+        }
+
+        let existing = std::mem::replace(
+            self,
+            Self::Tabs {
+                pages: Vec::new(),
+                active: 0,
+            },
+        );
+        *self = match action {
+            DropAction::Tab | DropAction::TabBefore => {
+                let (mut pages, _) = existing.into_pages();
+                let (moving_pages, active) = moving.into_pages();
+                let index = pages
+                    .iter()
+                    .position(|page| page.id == target)
+                    .expect("validated target tab");
+                let insert_at = index + usize::from(action == DropAction::Tab);
+                pages.splice(insert_at..insert_at, moving_pages);
+                Self::Tabs {
+                    pages,
+                    active: insert_at + active,
+                }
+            }
+            _ => {
+                let direction = match action {
+                    DropAction::SplitHorizontalBefore => NavDirection::Left,
+                    DropAction::SplitHorizontal => NavDirection::Right,
+                    DropAction::SplitVerticalBefore => NavDirection::Up,
+                    DropAction::SplitVertical => NavDirection::Down,
+                    _ => unreachable!("expected a split action"),
+                };
+                Self::split_pair(existing, moving, direction)
+            }
+        };
+    }
+
+    fn into_pages(self) -> (Vec<TabPage>, usize) {
+        match self {
+            Self::Leaf { id, projection } => (vec![TabPage { id, projection }], 0),
+            Self::Tabs { pages, active } => (pages, active),
+            Self::Split { .. } => unreachable!("only panes can become tabs"),
+        }
+    }
+
+    fn split_pair(existing: Self, new: Self, direction: NavDirection) -> Self {
+        let nodes = if direction.insert_before() {
+            [new, existing]
+        } else {
+            [existing, new]
+        };
+        Self::Split {
+            direction: direction.axis(),
+            children: nodes
+                .into_iter()
+                .map(|node| TileChild {
+                    node,
+                    constraint: Constraint::Fill(1),
+                })
+                .collect(),
+        }
+    }
+
+    fn activate(&mut self, target: usize) -> bool {
+        match self {
+            Self::Leaf { id, .. } => *id == target,
+            Self::Split { children, .. } => {
+                children.iter_mut().any(|child| child.node.activate(target))
+            }
+            Self::Tabs { pages, active } => {
+                let Some(index) = pages.iter().position(|page| page.id == target) else {
+                    return false;
+                };
+                *active = index;
+                true
+            }
+        }
+    }
+
+    fn matching_slots<'a>(
+        &'a mut self,
+        ids: [usize; 2],
+        slots: &mut Vec<(&'a mut usize, &'a mut Projection)>,
+    ) {
+        match self {
+            Self::Leaf { id, projection } if ids.contains(id) => slots.push((id, projection)),
+            Self::Split { children, .. } => {
+                for child in children {
+                    child.node.matching_slots(ids, slots);
+                }
+            }
+            Self::Tabs { pages, .. } => {
+                for page in pages.iter_mut().filter(|page| ids.contains(&page.id)) {
+                    slots.push((&mut page.id, &mut page.projection));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn swap_slots(&mut self, source: usize, target: usize) -> bool {
+        let mut slots = Vec::with_capacity(2);
+        self.matching_slots([source, target], &mut slots);
+        let [(left_id, left), (right_id, right)] = slots.as_mut_slice() else {
+            return false;
+        };
+        std::mem::swap(*left_id, *right_id);
+        std::mem::swap(*left, *right);
+        true
+    }
+
     fn collect_rects(&self, area: Rect, out: &mut Vec<(usize, Rect, bool)>) {
         match self {
             TileNode::Leaf { id, projection } => {
@@ -209,13 +406,13 @@ impl TileNode {
         }
     }
 
-    fn first_leaf_id(&self) -> Option<usize> {
+    fn first_visible_id(&self) -> Option<usize> {
         match self {
             TileNode::Leaf { id, .. } => Some(*id),
             TileNode::Split { children, .. } => {
-                children.iter().find_map(|c| c.node.first_leaf_id())
+                children.iter().find_map(|c| c.node.first_visible_id())
             }
-            TileNode::Tabs { pages, .. } => pages.first().map(|p| p.id),
+            TileNode::Tabs { pages, active } => pages.get(*active).map(|p| p.id),
         }
     }
 
@@ -407,24 +604,7 @@ impl TileNode {
                         id: new_id,
                         projection: new_projection,
                     };
-                    let (first, second) = if dir.insert_before() {
-                        (new_leaf, existing)
-                    } else {
-                        (existing, new_leaf)
-                    };
-                    *self = TileNode::Split {
-                        direction: dir.axis(),
-                        children: vec![
-                            TileChild {
-                                constraint: Constraint::Fill(1),
-                                node: first,
-                            },
-                            TileChild {
-                                constraint: Constraint::Fill(1),
-                                node: second,
-                            },
-                        ],
-                    };
+                    *self = Self::split_pair(existing, new_leaf, dir);
                     Ok(())
                 } else {
                     Err(new_projection)
@@ -477,24 +657,7 @@ impl TileNode {
                         id: new_id,
                         projection: new_projection,
                     };
-                    let (first, second) = if dir.insert_before() {
-                        (new_leaf, existing)
-                    } else {
-                        (existing, new_leaf)
-                    };
-                    *self = TileNode::Split {
-                        direction: dir.axis(),
-                        children: vec![
-                            TileChild {
-                                constraint: Constraint::Fill(1),
-                                node: first,
-                            },
-                            TileChild {
-                                constraint: Constraint::Fill(1),
-                                node: second,
-                            },
-                        ],
-                    };
+                    *self = Self::split_pair(existing, new_leaf, dir);
                     Ok(())
                 } else {
                     Err(new_projection)
@@ -587,83 +750,6 @@ impl TileNode {
                 };
                 *active = next;
                 Some(pages[next].id)
-            }
-        }
-    }
-
-    fn remove_leaf(self, target_id: usize) -> (Option<TileNode>, bool) {
-        match self {
-            TileNode::Leaf { id, .. } if id == target_id => (None, true),
-            leaf @ TileNode::Leaf { .. } => (Some(leaf), false),
-            TileNode::Split {
-                direction,
-                children,
-            } => {
-                let mut removed = false;
-                let mut kept = Vec::with_capacity(children.len());
-                for child in children {
-                    if removed {
-                        kept.push(child);
-                        continue;
-                    }
-                    let (node, did_remove) = child.node.remove_leaf(target_id);
-                    if did_remove {
-                        removed = true;
-                    }
-                    if let Some(node) = node {
-                        kept.push(TileChild {
-                            constraint: child.constraint,
-                            node,
-                        });
-                    }
-                }
-                if !removed {
-                    return (
-                        Some(TileNode::Split {
-                            direction,
-                            children: kept,
-                        }),
-                        false,
-                    );
-                }
-                match kept.len() {
-                    0 => (None, true),
-                    1 => (Some(kept.pop().unwrap().node), true),
-                    _ => (
-                        Some(TileNode::Split {
-                            direction,
-                            children: kept,
-                        }),
-                        true,
-                    ),
-                }
-            }
-            TileNode::Tabs { mut pages, active } => {
-                let Some(index) = pages.iter().position(|page| page.id == target_id) else {
-                    return (Some(TileNode::Tabs { pages, active }), false);
-                };
-                pages.remove(index);
-                if pages.is_empty() {
-                    return (None, true);
-                }
-                if pages.len() == 1 {
-                    let page = pages.pop().unwrap();
-                    return (
-                        Some(TileNode::Leaf {
-                            id: page.id,
-                            projection: page.projection,
-                        }),
-                        true,
-                    );
-                }
-                let active = if active >= pages.len() {
-                    pages.len() - 1
-                } else if index < active {
-                    active - 1
-                } else {
-                    active
-                };
-                (Some(TileNode::Tabs { pages, active }), true)
             }
         }
     }
@@ -781,7 +867,10 @@ impl Scope {
             })
         };
 
-        let focused_id = root.as_ref().and_then(|n| n.first_leaf_id()).unwrap_or(0);
+        let focused_id = root
+            .as_ref()
+            .and_then(|n| n.first_visible_id())
+            .unwrap_or(0);
         let mut scope = Self {
             root,
             focused_id,
@@ -902,38 +991,112 @@ impl Scope {
         let Some(root) = self.root.take() else {
             return Ok(false);
         };
-        let (root, removed) = root.remove_leaf(projection_id);
+        let (root, removed) = root.extract(projection_id, false);
+        let removed = removed.is_some();
         self.root = root;
         if removed {
-            self.focused_id = self
-                .root
-                .as_ref()
-                .and_then(TileNode::first_leaf_id)
-                .unwrap_or(0);
-            self.layout_revision = self.layout_revision.wrapping_add(1);
+            if self.focused_id == projection_id {
+                self.focused_id = self
+                    .root
+                    .as_ref()
+                    .and_then(TileNode::first_visible_id)
+                    .unwrap_or(0);
+            }
             self.resize(self.area)?;
         }
         Ok(removed)
     }
 
     pub fn move_focus(&mut self, dir: NavDirection) {
-        let Some(root) = &self.root else {
-            return;
-        };
-        let mut rects = Vec::new();
-        root.collect_rects(self.area, &mut rects);
-
-        let Some((_, current, _)) = rects
-            .iter()
-            .find(|(id, _, _)| *id == self.focused_id)
-            .copied()
-        else {
-            return;
-        };
-
-        if let Some(next_id) = find_neighbor(&rects, self.focused_id, current, dir) {
+        if let Some(next_id) = self.focus_neighbor(dir) {
             self.focused_id = next_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);
+        }
+    }
+
+    fn focus_neighbor(&self, dir: NavDirection) -> Option<usize> {
+        let root = self.root.as_ref()?;
+        let mut rects = Vec::new();
+        root.collect_rects(self.area, &mut rects);
+        let (_, current, _) = rects.iter().find(|(id, _, _)| *id == self.focused_id)?;
+        find_neighbor(&rects, self.focused_id, *current, dir)
+    }
+
+    pub fn drop_projection(
+        &mut self,
+        source: usize,
+        target: usize,
+        action: DropAction,
+        whole_stack: bool,
+    ) -> io::Result<bool> {
+        let Some(root) = &mut self.root else {
+            return Ok(false);
+        };
+        let (Some(source_pane), Some(target_pane)) = (root.pane(source), root.pane(target)) else {
+            return Ok(false);
+        };
+        let same_pane = std::ptr::eq(source_pane, target_pane);
+        let target = if same_pane && action.is_split() && !whole_stack {
+            let TileNode::Tabs { pages, .. } = source_pane else {
+                return Ok(false);
+            };
+            let Some(sibling) = pages.iter().find(|page| page.id != source) else {
+                return Ok(false);
+            };
+            sibling.id
+        } else if source == target || (same_pane && whole_stack) {
+            return Ok(false);
+        } else {
+            target
+        };
+
+        if whole_stack && !matches!(source_pane, TileNode::Tabs { pages, .. } if pages.len() > 1) {
+            return Ok(false);
+        }
+        let action = if whole_stack && action == DropAction::Swap {
+            DropAction::Tab
+        } else {
+            action
+        };
+        if action == DropAction::Swap {
+            if !root.swap_slots(source, target) {
+                return Ok(false);
+            }
+        } else {
+            // Both projections exist, and the destination survives extraction.
+            let root = self.root.take().expect("validated root");
+            let (remainder, moving) = root.extract(source, whole_stack);
+            let mut root = remainder.expect("validated destination");
+            root.insert_drop(target, moving.expect("validated source"), action);
+            self.root = Some(root);
+        }
+
+        self.focused_id = source;
+        self.root
+            .as_mut()
+            .expect("root after drop")
+            .activate(source);
+        self.resize(self.area)?;
+        Ok(true)
+    }
+
+    pub fn move_projection(&mut self, dir: NavDirection) -> io::Result<bool> {
+        let Some(target) = self.focus_neighbor(dir) else {
+            return Ok(false);
+        };
+        self.drop_projection(self.focused_id, target, DropAction::Swap, false)
+    }
+
+    pub fn activate_projection(&mut self, id: usize) -> bool {
+        if self.focused_id == id {
+            return false;
+        }
+        if self.root.as_mut().is_some_and(|root| root.activate(id)) {
+            self.focused_id = id;
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -1141,6 +1304,77 @@ fn find_neighbor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_drop_preserves_projection_and_revision() {
+        let mut scope = Scope::from_children(
+            Direction::Horizontal,
+            (0..2)
+                .map(|_| (Constraint::Fill(1), Projection::ServerDebug))
+                .collect(),
+            Rect::new(0, 0, 80, 24),
+        )
+        .unwrap();
+        let source = scope.focused_id;
+        let revision = scope.revision();
+        assert!(
+            !scope
+                .drop_projection(source, usize::MAX, DropAction::Tab, false)
+                .unwrap()
+        );
+        assert_eq!(scope.leaf_count(), 2);
+        assert_eq!(scope.revision(), revision);
+        assert_eq!(scope.focused_id, source);
+    }
+
+    #[test]
+    fn moves_keep_projection_ids_and_focus_with_the_projection() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut scope = Scope::from_children(
+            Direction::Horizontal,
+            (0..3)
+                .map(|_| (Constraint::Fill(1), Projection::ServerDebug))
+                .collect(),
+            area,
+        )
+        .unwrap();
+
+        assert!(scope.move_projection(NavDirection::Right).unwrap());
+        let mut rects = Vec::new();
+        scope.root.as_ref().unwrap().collect_rects(area, &mut rects);
+        assert_eq!(
+            rects.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            [1, 0, 2]
+        );
+        assert_eq!(scope.focused_id, 0);
+
+        assert!(scope.drop_projection(0, 1, DropAction::Tab, false).unwrap());
+        assert!(scope.drop_projection(1, 0, DropAction::Tab, false).unwrap());
+        assert!(
+            scope
+                .drop_projection(1, 2, DropAction::TabBefore, true)
+                .unwrap()
+        );
+        let Some(TileNode::Tabs { pages, active }) = &scope.root else {
+            panic!("expected a merged stack");
+        };
+        assert_eq!(
+            pages.iter().map(|page| page.id).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(pages[*active].id, 1);
+
+        assert!(
+            scope
+                .drop_projection(1, 1, DropAction::SplitVerticalBefore, false)
+                .unwrap()
+        );
+        let mut rects = Vec::new();
+        scope.root.as_ref().unwrap().collect_rects(area, &mut rects);
+        assert_eq!((rects[0].0, rects[0].1), (1, Rect::new(0, 0, 80, 12)));
+        assert_eq!(scope.leaf_count(), 3);
+        assert_eq!(scope.focused_id, 1);
+    }
 
     #[test]
     fn find_neighbor_navigates_2d_grid() {

@@ -11,7 +11,7 @@ use tui_term::{vt100, widget::PseudoTerminal};
 
 use crate::{
     debug::ServerDebugProjection,
-    protocol::{ScopeSnapshot, SnapshotNode, SplitDir, TabPageSnapshot},
+    protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir, TabPageSnapshot},
     server::ServerTraceEntry,
 };
 
@@ -59,13 +59,7 @@ impl<'a> SnapshotView<'a> {
                 direction,
                 children,
             } => {
-                let dir = match direction {
-                    SplitDir::Horizontal => Direction::Horizontal,
-                    SplitDir::Vertical => Direction::Vertical,
-                };
-                let constraints: Vec<Constraint> =
-                    children.iter().map(|c| Constraint::Fill(c.fill)).collect();
-                let rects = Layout::new(dir, constraints).split(area);
+                let rects = split_layout(*direction, children).split(area);
                 for (child, rect) in children.iter().zip(rects.iter()) {
                     self.render_node(&child.node, *rect, buf);
                 }
@@ -102,75 +96,150 @@ impl Widget for &SnapshotView<'_> {
     }
 }
 
-/// Returns the id of the projection rendered at screen position `(x, y)`,
-/// mirroring the layout math used by [`SnapshotView::render_node`].
-pub fn pane_at(node: &SnapshotNode, area: Rect, x: u16, y: u16) -> Option<usize> {
-    if !area.contains(Position::new(x, y)) {
+fn split_layout(direction: SplitDir, children: &[SnapshotChild]) -> Layout {
+    let direction = match direction {
+        SplitDir::Horizontal => Direction::Horizontal,
+        SplitDir::Vertical => Direction::Vertical,
+    };
+    Layout::new(
+        direction,
+        children.iter().map(|child| Constraint::Fill(child.fill)),
+    )
+}
+
+fn find_pane<T>(
+    node: &SnapshotNode,
+    area: Rect,
+    inside: impl Fn(Rect) -> bool + Copy,
+    find: impl Fn(&SnapshotNode, Rect) -> Option<T> + Copy,
+) -> Option<T> {
+    if !inside(area) {
         return None;
     }
     match node {
-        SnapshotNode::Leaf { id, .. } | SnapshotNode::Debug { id } => Some(*id),
         SnapshotNode::Split {
             direction,
             children,
         } => {
-            let dir = match direction {
-                SplitDir::Horizontal => Direction::Horizontal,
-                SplitDir::Vertical => Direction::Vertical,
-            };
-            let constraints: Vec<Constraint> =
-                children.iter().map(|c| Constraint::Fill(c.fill)).collect();
-            let rects = Layout::new(dir, constraints).split(area);
-            for (child, rect) in children.iter().zip(rects.iter()) {
-                if let Some(id) = pane_at(&child.node, *rect, x, y) {
-                    return Some(id);
-                }
-            }
-            None
-        }
-        SnapshotNode::Tabs { pages, active } => pages.get(*active).map(|p| p.id),
-    }
-}
-
-/// Returns the terminal cell area rendered for a pane, matching
-/// [`SnapshotView::render_node`] so mouse coordinates map to parser cells.
-pub fn pane_content_rect(node: &SnapshotNode, area: Rect, id: usize) -> Option<Rect> {
-    match node {
-        SnapshotNode::Leaf { id: leaf_id, .. } | SnapshotNode::Debug { id: leaf_id }
-            if *leaf_id == id =>
-        {
-            Some(Block::bordered().inner(area))
-        }
-        SnapshotNode::Leaf { .. } | SnapshotNode::Debug { .. } => None,
-        SnapshotNode::Split {
-            direction,
-            children,
-        } => {
-            let dir = match direction {
-                SplitDir::Horizontal => Direction::Horizontal,
-                SplitDir::Vertical => Direction::Vertical,
-            };
-            let constraints: Vec<Constraint> = children
-                .iter()
-                .map(|child| Constraint::Fill(child.fill))
-                .collect();
-            let rects = Layout::new(dir, constraints).split(area);
+            let rects = split_layout(*direction, children).split(area);
             children
                 .iter()
                 .zip(rects.iter())
-                .find_map(|(child, rect)| pane_content_rect(&child.node, *rect, id))
+                .find_map(|(child, rect)| find_pane(&child.node, *rect, inside, find))
         }
-        SnapshotNode::Tabs { pages, active } => pages
-            .get(*active)
-            .filter(|page| page.id == id)
-            .map(|_| Block::bordered().inner(area)),
+        _ => find(node, area),
     }
+}
+
+fn active_id(node: &SnapshotNode) -> Option<usize> {
+    match node {
+        SnapshotNode::Leaf { id, .. } | SnapshotNode::Debug { id } => Some(*id),
+        SnapshotNode::Tabs { pages, active } => pages.get(*active).map(|page| page.id),
+        SnapshotNode::Split { .. } => None,
+    }
+}
+
+/// Returns the visible projection under the pointer.
+pub fn pane_at(node: &SnapshotNode, area: Rect, x: u16, y: u16) -> Option<usize> {
+    find_pane(
+        node,
+        area,
+        |rect| rect.contains(Position::new(x, y)),
+        |node, _| active_id(node),
+    )
+}
+
+#[derive(Clone, Copy)]
+pub struct PaneHit {
+    pub active_id: usize,
+    pub area: Rect,
+    pub is_stack: bool,
+    pub tab: Option<(usize, Rect)>,
+}
+
+pub fn hit_pane(node: &SnapshotNode, area: Rect, pos: Position) -> Option<PaneHit> {
+    find_pane(
+        node,
+        area,
+        |rect| rect.contains(pos),
+        |node, area| {
+            let pages = stack_pages(node);
+            let tab = if pos.y == area.y {
+                tab_rects(pages, area).find(|(_, rect)| rect.contains(pos))
+            } else {
+                None
+            };
+            Some(PaneHit {
+                active_id: active_id(node)?,
+                area,
+                is_stack: !pages.is_empty(),
+                tab,
+            })
+        },
+    )
+}
+
+pub fn projection_position(
+    node: &SnapshotNode,
+    area: Rect,
+    id: usize,
+) -> Option<(Rect, Option<Rect>)> {
+    find_pane(
+        node,
+        area,
+        |_| true,
+        |node, area| {
+            let pages = stack_pages(node);
+            if active_id(node) != Some(id) && !pages.iter().any(|page| page.id == id) {
+                return None;
+            }
+            let tab =
+                tab_rects(pages, area).find_map(|(page_id, rect)| (page_id == id).then_some(rect));
+            Some((area, tab))
+        },
+    )
+}
+
+/// Returns the terminal cell area used by the renderer for the visible projection.
+pub fn pane_content_rect(node: &SnapshotNode, area: Rect, id: usize) -> Option<Rect> {
+    find_pane(
+        node,
+        area,
+        |_| true,
+        |node, area| (active_id(node) == Some(id)).then(|| Block::bordered().inner(area)),
+    )
+}
+
+fn stack_pages(node: &SnapshotNode) -> &[TabPageSnapshot] {
+    match node {
+        SnapshotNode::Tabs { pages, .. } if pages.len() > 1 => pages,
+        _ => &[],
+    }
+}
+
+fn tab_text(page: &TabPageSnapshot) -> Span<'static> {
+    Span::raw(format!("  {}  ", page.name))
+}
+
+fn tab_rects(pages: &[TabPageSnapshot], area: Rect) -> impl Iterator<Item = (usize, Rect)> + '_ {
+    // Block titles start after the left border and end before the right border.
+    let mut x = area.x.saturating_add(1);
+    let right = area.right().saturating_sub(1);
+    pages.iter().map_while(move |page| {
+        let available = right.saturating_sub(x);
+        if area.height == 0 || available == 0 {
+            return None;
+        }
+        let width = tab_text(page).width().min(usize::from(available)) as u16;
+        let rect = Rect::new(x, area.y, width, 1);
+        x += width;
+        Some((page.id, rect))
+    })
 }
 
 fn render_tab_bar_line(pages: &[TabPageSnapshot], active: usize) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (i, page) in pages.iter().enumerate() {
-        let label = format!(" {} ", page.name);
         let style = if i == active {
             Style::default()
                 .fg(Color::Black)
@@ -179,7 +248,7 @@ fn render_tab_bar_line(pages: &[TabPageSnapshot], active: usize) -> Line<'static
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        spans.push(Span::styled(label, style));
+        spans.push(tab_text(page).style(style));
     }
 
     Line::from(spans)
