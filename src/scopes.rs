@@ -130,6 +130,12 @@ impl Projection {
             Projection::ServerDebug => 0,
         }
     }
+
+    fn force_close(&mut self) {
+        if let Projection::Term(term) = self {
+            term.force_close();
+        }
+    }
 }
 
 struct TileChild {
@@ -585,6 +591,83 @@ impl TileNode {
         }
     }
 
+    fn remove_leaf(self, target_id: usize) -> (Option<TileNode>, bool) {
+        match self {
+            TileNode::Leaf { id, .. } if id == target_id => (None, true),
+            leaf @ TileNode::Leaf { .. } => (Some(leaf), false),
+            TileNode::Split {
+                direction,
+                children,
+            } => {
+                let mut removed = false;
+                let mut kept = Vec::with_capacity(children.len());
+                for child in children {
+                    if removed {
+                        kept.push(child);
+                        continue;
+                    }
+                    let (node, did_remove) = child.node.remove_leaf(target_id);
+                    if did_remove {
+                        removed = true;
+                    }
+                    if let Some(node) = node {
+                        kept.push(TileChild {
+                            constraint: child.constraint,
+                            node,
+                        });
+                    }
+                }
+                if !removed {
+                    return (
+                        Some(TileNode::Split {
+                            direction,
+                            children: kept,
+                        }),
+                        false,
+                    );
+                }
+                match kept.len() {
+                    0 => (None, true),
+                    1 => (Some(kept.pop().unwrap().node), true),
+                    _ => (
+                        Some(TileNode::Split {
+                            direction,
+                            children: kept,
+                        }),
+                        true,
+                    ),
+                }
+            }
+            TileNode::Tabs { mut pages, active } => {
+                let Some(index) = pages.iter().position(|page| page.id == target_id) else {
+                    return (Some(TileNode::Tabs { pages, active }), false);
+                };
+                pages.remove(index);
+                if pages.is_empty() {
+                    return (None, true);
+                }
+                if pages.len() == 1 {
+                    let page = pages.pop().unwrap();
+                    return (
+                        Some(TileNode::Leaf {
+                            id: page.id,
+                            projection: page.projection,
+                        }),
+                        true,
+                    );
+                }
+                let active = if active >= pages.len() {
+                    pages.len() - 1
+                } else if index < active {
+                    active - 1
+                } else {
+                    active
+                };
+                (Some(TileNode::Tabs { pages, active }), true)
+            }
+        }
+    }
+
     fn prune_exited(node_opt: &mut Option<TileNode>) -> io::Result<bool> {
         let Some(node) = node_opt else {
             return Ok(false);
@@ -805,6 +888,32 @@ impl Scope {
             self.resize(self.area)?;
         }
         Ok(changed)
+    }
+
+    pub fn close_projection(&mut self, projection_id: usize) -> io::Result<bool> {
+        let Some(projection) = self
+            .root
+            .as_mut()
+            .and_then(|root| root.find_mut(projection_id))
+        else {
+            return Ok(false);
+        };
+        projection.force_close();
+        let Some(root) = self.root.take() else {
+            return Ok(false);
+        };
+        let (root, removed) = root.remove_leaf(projection_id);
+        self.root = root;
+        if removed {
+            self.focused_id = self
+                .root
+                .as_ref()
+                .and_then(TileNode::first_leaf_id)
+                .unwrap_or(0);
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+            self.resize(self.area)?;
+        }
+        Ok(removed)
     }
 
     pub fn move_focus(&mut self, dir: NavDirection) {

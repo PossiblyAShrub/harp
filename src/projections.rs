@@ -16,7 +16,7 @@ use anyhow::Result;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::Buffer,
@@ -134,6 +134,7 @@ impl Widget for &ProjectionStatus {
 
 pub struct ProjectionTerm {
     master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     exited: Arc<AtomicBool>,
@@ -188,6 +189,7 @@ impl ProjectionTerm {
             cmd.env("TERM", "xterm-256color");
         }
         let mut child = pty.slave.spawn_command(cmd)?;
+        let killer = child.clone_killer();
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let exited = Arc::new(AtomicBool::new(false));
@@ -255,6 +257,7 @@ impl ProjectionTerm {
 
         Ok(Self {
             master: pty.master,
+            killer,
             writer,
             parser,
             exited,
@@ -316,6 +319,11 @@ impl ProjectionTerm {
             Event::Resize(cols, rows) => self.resize(*cols, *rows),
             Event::FocusGained | Event::FocusLost => Ok(()),
         }
+    }
+
+    pub fn force_close(&mut self) {
+        let _ = self.killer.kill();
+        *self.writer.lock().unwrap() = None;
     }
 
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> io::Result<()> {

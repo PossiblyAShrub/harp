@@ -142,6 +142,10 @@ pub enum ClientMsg {
         scope_id: u64,
         event: Event,
     },
+    CloseProjection {
+        scope_id: u64,
+        projection_id: usize,
+    },
     MoveFocus {
         scope_id: u64,
         dir: NavDir,

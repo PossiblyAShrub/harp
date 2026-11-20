@@ -274,6 +274,36 @@ impl ServerState {
                     None => ServerMsg::ScopeClosed,
                 }
             }
+            ClientMsg::CloseProjection {
+                scope_id,
+                projection_id,
+            } => {
+                let Some(entry) = self.find_mut(scope_id) else {
+                    return ServerMsg::ScopeClosed;
+                };
+                match entry.scope.close_projection(projection_id) {
+                    Ok(true) => {}
+                    Ok(false) => return ServerMsg::Error("projection not found".to_string()),
+                    Err(e) => return ServerMsg::Error(e.to_string()),
+                }
+                if let Some(entry) = self.find_mut(scope_id)
+                    && let Some(snapshot) = entry.scope.snapshot(scope_id, entry.name.clone())
+                {
+                    return ServerMsg::Snapshot(snapshot);
+                }
+                self.scopes.retain(|entry| !entry.scope.is_empty());
+                ServerMsg::Scopes(
+                    self.scopes
+                        .iter()
+                        .map(|entry| ScopeInfo {
+                            id: entry.id,
+                            name: entry.name.clone(),
+                            cwd: entry.cwd.clone(),
+                            pane_count: entry.scope.leaf_count(),
+                        })
+                        .collect(),
+                )
+            }
             ClientMsg::MoveFocus { scope_id, dir } => {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;

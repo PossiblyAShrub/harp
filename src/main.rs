@@ -62,6 +62,7 @@ struct App {
     scroll: HashMap<usize, usize>,
     /// Previous local left click, used to recognize a double-click.
     last_click: Option<(Instant, usize, u16, u16)>,
+    pending_q: Option<(Instant, Mode)>,
     exit: bool,
 }
 
@@ -90,6 +91,7 @@ impl App {
             copy_mode: None,
             scroll: HashMap::new(),
             last_click: None,
+            pending_q: None,
             exit: false,
         };
 
@@ -250,7 +252,19 @@ impl App {
             ServerMsg::Error(e) => {
                 self.status.set_error(Some(e));
             }
-            ServerMsg::Scopes(_) => {}
+            ServerMsg::Scopes(scopes) => {
+                self.snapshot = None;
+                self.parsers.clear();
+                self.scroll.clear();
+                self.copy_mode = None;
+                if scopes.is_empty() {
+                    self.status.set_scope_name(None);
+                    self.exit = true;
+                } else {
+                    self.set_mode(Mode::Managing);
+                    self.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
+                }
+            }
         }
         Ok(())
     }
@@ -542,6 +556,10 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
+            self.flush_expired_q()?;
+            if self.exit {
+                break;
+            }
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(16))? {
@@ -561,6 +579,92 @@ impl App {
         Ok(())
     }
 
+    fn handle_q_gesture(&mut self, event: &Event) -> io::Result<bool> {
+        const DOUBLE_Q_WINDOW: Duration = Duration::from_millis(400);
+        let is_q_press = matches!(event, Event::Key(key)
+            if key.code == KeyCode::Char('q')
+                && key.modifiers == KeyModifiers::NONE
+                && key.kind == KeyEventKind::Press);
+        let is_q_repeat = matches!(event, Event::Key(key)
+            if key.code == KeyCode::Char('q')
+                && key.modifiers == KeyModifiers::NONE
+                && key.kind == KeyEventKind::Repeat);
+        let is_q_release = matches!(event, Event::Key(key)
+            if key.code == KeyCode::Char('q')
+                && key.modifiers == KeyModifiers::NONE
+                && key.kind == KeyEventKind::Release);
+        let can_close = self.snapshot.is_some()
+            && self.picker.is_none()
+            && self.switcher.is_none()
+            && self.rename.is_none()
+            && self.copy_mode.is_none();
+
+        if !can_close {
+            if self.pending_q.is_some() {
+                self.flush_pending_q()?;
+            }
+            return Ok(false);
+        }
+
+        if let Some((started, _)) = self.pending_q {
+            if is_q_repeat || is_q_release {
+                return Ok(true);
+            }
+            if is_q_press && started.elapsed() <= DOUBLE_Q_WINDOW {
+                self.pending_q = None;
+                self.status.set_error(None);
+                if let Some(snap) = &self.snapshot {
+                    let scope_id = snap.scope_id;
+                    let projection_id = snap.focused_id;
+                    self.client.send(&ClientMsg::CloseProjection {
+                        scope_id,
+                        projection_id,
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+                return Ok(true);
+            }
+            self.flush_pending_q()?;
+        }
+
+        if is_q_press {
+            self.pending_q = Some((Instant::now(), self.mode));
+            let prompt = if self.mode == Mode::Managing {
+                "Press q again to close projection, or wait to detach".to_string()
+            } else {
+                "Press q again within 400 ms to close projection".to_string()
+            };
+            self.status.set_error(Some(prompt));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn flush_pending_q(&mut self) -> io::Result<()> {
+        let Some((_, mode)) = self.pending_q.take() else {
+            return Ok(());
+        };
+        self.status.set_error(None);
+        match mode {
+            Mode::Managing => self.exit = true,
+            Mode::Interacting => self.forward_event(Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            ))?,
+        }
+        Ok(())
+    }
+
+    fn flush_expired_q(&mut self) -> io::Result<()> {
+        if self
+            .pending_q
+            .is_some_and(|(started, _)| started.elapsed() >= Duration::from_millis(400))
+        {
+            self.flush_pending_q()?;
+        }
+        Ok(())
+    }
+
     fn render(&self, frame: &mut Frame) {
         frame.render_widget(self, frame.area());
     }
@@ -568,6 +672,13 @@ impl App {
     fn handle_events(&mut self) -> io::Result<()> {
         loop {
             let event = event::read()?;
+
+            if self.handle_q_gesture(&event)? {
+                if self.exit || !event::poll(Duration::ZERO)? {
+                    break;
+                }
+                continue;
+            }
 
             if self
                 .copy_mode
