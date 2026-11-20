@@ -1,10 +1,10 @@
 use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use crossterm::execute;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
+use crossterm::execute;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,7 +26,9 @@ mod view;
 use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus};
-use protocol::{ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir};
+use protocol::{
+    ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir,
+};
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
 use view::SnapshotView;
@@ -121,8 +123,7 @@ impl App {
             SnapshotNode::Tabs { pages, .. } => {
                 for page in pages {
                     active_ids.push(page.id);
-                    let mut parser =
-                        vt100::Parser::new(page.rows.max(1), page.cols.max(1), 0);
+                    let mut parser = vt100::Parser::new(page.rows.max(1), page.cols.max(1), 0);
                     parser.process(&page.state);
                     self.parsers.insert(page.id, parser);
                 }
@@ -185,7 +186,12 @@ impl App {
         match self.client.recv::<ServerMsg>()? {
             ServerMsg::Scopes(scopes) => {
                 let scope_id = self.snapshot.as_ref().map(|s| s.scope_id);
-                let scope_num = scopes.iter().enumerate().find(|(_, s)| Some(s.id) == scope_id).map(|(num, _)| num).unwrap_or(0);
+                let scope_num = scopes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| Some(s.id) == scope_id)
+                    .map(|(num, _)| num)
+                    .unwrap_or(0);
                 self.switcher = Some(ScopeSwitcher::new(scopes, scope_num, allow_cancel));
             }
             ServerMsg::Error(e) => self.status.set_error(Some(e)),
@@ -224,8 +230,7 @@ impl App {
             let event = event::read()?;
 
             if let Event::Resize(cols, rows) = event {
-                self.workspace_area =
-                    Rect::new(0, 0, cols.max(1), rows.saturating_sub(1).max(1));
+                self.workspace_area = Rect::new(0, 0, cols.max(1), rows.saturating_sub(1).max(1));
                 if let Some(snap) = &self.snapshot {
                     self.client.send(&ClientMsg::Resize {
                         scope_id: snap.scope_id,
@@ -410,9 +415,7 @@ impl App {
                                 if key_event.modifiers.contains(KeyModifiers::ALT) {
                                     if let Some(snap) = &self.snapshot {
                                         let tab_dir = match dir {
-                                            NavDirection::Left | NavDirection::Up => {
-                                                TabDir::Prev
-                                            }
+                                            NavDirection::Left | NavDirection::Up => TabDir::Prev,
                                             NavDirection::Right | NavDirection::Down => {
                                                 TabDir::Next
                                             }
@@ -425,10 +428,8 @@ impl App {
                                         self.handle_server_reply(reply)?;
                                     }
                                 } else if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                                    self.picker = Some(ScopePicker::new(
-                                        dir,
-                                        self.default_cwd.clone(),
-                                    ));
+                                    self.picker =
+                                        Some(ScopePicker::new(dir, self.default_cwd.clone()));
                                 } else if let Some(snap) = &self.snapshot {
                                     if key_event.modifiers.contains(KeyModifiers::CONTROL) {
                                         self.client.send(&ClientMsg::Split {

@@ -3,10 +3,7 @@ use std::{
     net::TcpStream,
 };
 
-use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit, Nonce,
-    aead::Aead,
-};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use serde::{Serialize, de::DeserializeOwned};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -65,9 +62,10 @@ impl EncryptedStream {
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         let plaintext = serde_json::to_vec(msg).map_err(io::Error::other)?;
         let nonce_bytes = make_nonce(self.is_client, self.send_counter);
-        self.send_counter = self.send_counter.checked_add(1).ok_or_else(|| {
-            io::Error::other("nonce counter overflow")
-        })?;
+        self.send_counter = self
+            .send_counter
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
 
         let ciphertext = self
             .cipher
@@ -100,18 +98,20 @@ impl EncryptedStream {
         self.stream.read_exact(&mut ciphertext)?;
 
         let nonce_bytes = make_nonce(!self.is_client, self.recv_counter);
-        self.recv_counter = self.recv_counter.checked_add(1).ok_or_else(|| {
-            io::Error::other("nonce counter overflow")
-        })?;
+        self.recv_counter = self
+            .recv_counter
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
 
         let plaintext = self
             .cipher
             .decrypt(&Nonce::from(nonce_bytes), ciphertext.as_slice())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}")))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}"))
+            })?;
 
-        serde_json::from_slice(&plaintext).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("decode error: {e}"))
-        })
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode error: {e}")))
     }
 }
 

@@ -72,7 +72,12 @@ impl Widget for &ScopeSwitcher {
         let popup_height = area.height.saturating_sub(2).min(desired_height).max(7);
         let x = area.x + area.width.saturating_sub(popup_width) / 2;
         let y = area.y + area.height.saturating_sub(popup_height) / 2;
-        let popup = Rect::new(x, y, popup_width.min(area.width), popup_height.min(area.height));
+        let popup = Rect::new(
+            x,
+            y,
+            popup_width.min(area.width),
+            popup_height.min(area.height),
+        );
 
         Clear.render(popup, buf);
 
@@ -219,7 +224,12 @@ impl Widget for &RenameModal {
         let popup_height = 6u16.min(area.height.saturating_sub(2)).max(5);
         let x = area.x + area.width.saturating_sub(popup_width) / 2;
         let y = area.y + area.height.saturating_sub(popup_height) / 2;
-        let popup = Rect::new(x, y, popup_width.min(area.width), popup_height.min(area.height));
+        let popup = Rect::new(
+            x,
+            y,
+            popup_width.min(area.width),
+            popup_height.min(area.height),
+        );
 
         Clear.render(popup, buf);
 
@@ -296,7 +306,10 @@ mod tests {
             switcher.handle_key(key(KeyCode::Enter)),
             SwitcherAction::CreateNew
         );
-        assert_eq!(switcher.handle_key(key(KeyCode::Esc)), SwitcherAction::Cancel);
+        assert_eq!(
+            switcher.handle_key(key(KeyCode::Esc)),
+            SwitcherAction::Cancel
+        );
     }
 
     #[test]

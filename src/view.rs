@@ -55,9 +55,7 @@ impl<'a> SnapshotView<'a> {
                 }
             }
             SnapshotNode::Tabs { pages, active } => {
-                let is_focused = pages
-                    .get(*active)
-                    .is_some_and(|p| p.id == focused_id);
+                let is_focused = pages.get(*active).is_some_and(|p| p.id == focused_id);
                 let border_style = if is_focused {
                     Style::default().fg(Color::White)
                 } else {

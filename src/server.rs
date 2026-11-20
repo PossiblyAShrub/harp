@@ -110,7 +110,10 @@ impl ServerState {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
-                if let Err(e) = entry.scope.resize(Rect::new(0, 0, cols.max(1), rows.max(1))) {
+                if let Err(e) = entry
+                    .scope
+                    .resize(Rect::new(0, 0, cols.max(1), rows.max(1)))
+                {
                     return ServerMsg::Error(e.to_string());
                 }
                 let name = entry.name.clone();
@@ -159,7 +162,10 @@ impl ServerState {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
-                if let Err(e) = entry.scope.resize(Rect::new(0, 0, cols.max(1), rows.max(1))) {
+                if let Err(e) = entry
+                    .scope
+                    .resize(Rect::new(0, 0, cols.max(1), rows.max(1)))
+                {
                     return ServerMsg::Error(e.to_string());
                 }
                 let name = entry.name.clone();

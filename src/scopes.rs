@@ -113,9 +113,18 @@ struct TabPage {
 }
 
 enum TileNode {
-    Leaf { id: usize, projection: Projection },
-    Split { direction: Direction, children: Vec<TileChild> },
-    Tabs { pages: Vec<TabPage>, active: usize },
+    Leaf {
+        id: usize,
+        projection: Projection,
+    },
+    Split {
+        direction: Direction,
+        children: Vec<TileChild>,
+    },
+    Tabs {
+        pages: Vec<TabPage>,
+        active: usize,
+    },
 }
 
 impl TileNode {
@@ -124,7 +133,10 @@ impl TileNode {
             TileNode::Leaf { id, projection } => {
                 out.push((*id, area, projection.needs_border()));
             }
-            TileNode::Split { direction, children } => {
+            TileNode::Split {
+                direction,
+                children,
+            } => {
                 let constraints: Vec<Constraint> = children.iter().map(|c| c.constraint).collect();
                 let rects = Layout::new(*direction, constraints).split(area);
                 for (child, rect) in children.iter().zip(rects.iter()) {
@@ -174,7 +186,10 @@ impl TileNode {
     fn resize(&mut self, area: Rect) -> io::Result<()> {
         match self {
             TileNode::Leaf { projection, .. } => projection.resize(area),
-            TileNode::Split { direction, children } => {
+            TileNode::Split {
+                direction,
+                children,
+            } => {
                 let constraints: Vec<Constraint> = children.iter().map(|c| c.constraint).collect();
                 let rects = Layout::new(*direction, constraints).split(area);
                 for (child, rect) in children.iter_mut().zip(rects.iter()) {
@@ -210,9 +225,7 @@ impl TileNode {
     fn leaf_count(&self) -> usize {
         match self {
             TileNode::Leaf { .. } => 1,
-            TileNode::Split { children, .. } => {
-                children.iter().map(|c| c.node.leaf_count()).sum()
-            }
+            TileNode::Split { children, .. } => children.iter().map(|c| c.node.leaf_count()).sum(),
             TileNode::Tabs { pages, .. } => pages.len(),
         }
     }
@@ -244,7 +257,9 @@ impl TileNode {
                             Constraint::Fill(n) => n,
                             _ => 1,
                         };
-                        c.node.to_snapshot().map(|node| SnapshotChild { fill, node })
+                        c.node
+                            .to_snapshot()
+                            .map(|node| SnapshotChild { fill, node })
                     })
                     .collect();
                 if snap_children.is_empty() {
@@ -328,12 +343,14 @@ impl TileNode {
                     Err(new_projection)
                 }
             }
-            TileNode::Split { direction, children } => {
+            TileNode::Split {
+                direction,
+                children,
+            } => {
                 if *direction == dir.axis() {
-                    if let Some(pos) = children
-                        .iter()
-                        .position(|c| matches!(c.node, TileNode::Leaf { id, .. } if id == target_id))
-                    {
+                    if let Some(pos) = children.iter().position(
+                        |c| matches!(c.node, TileNode::Leaf { id, .. } if id == target_id),
+                    ) {
                         let insert_idx = if dir.insert_before() { pos } else { pos + 1 };
                         children.insert(
                             insert_idx,
@@ -416,10 +433,7 @@ impl TileNode {
                         },
                     );
                     let existing_leaf = match existing {
-                        TileNode::Leaf { id, projection } => TabPage {
-                            id,
-                            projection,
-                        },
+                        TileNode::Leaf { id, projection } => TabPage { id, projection },
                         _ => unreachable!("leaf match guaranteed"),
                     };
                     *self = TileNode::Tabs {
@@ -701,7 +715,10 @@ impl Scope {
         let mut rects = Vec::new();
         root.collect_rects(self.area, &mut rects);
 
-        let Some((_, current, _)) = rects.iter().find(|(id, _, _)| *id == self.focused_id).copied()
+        let Some((_, current, _)) = rects
+            .iter()
+            .find(|(id, _, _)| *id == self.focused_id)
+            .copied()
         else {
             return;
         };
@@ -715,12 +732,8 @@ impl Scope {
     pub fn split_focused_with_spec(&mut self, dir: NavDirection, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let term = ProjectionTerm::with_command(
-                inner.width,
-                inner.height,
-                &spec.program,
-                &spec.cwd,
-            )?;
+            let term =
+                ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
             let id = self.next_id;
             self.next_id += 1;
             self.root = Some(TileNode::Leaf {
@@ -734,8 +747,12 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder =
-            Projection::Term(ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?);
+        let placeholder = Projection::Term(ProjectionTerm::with_command(
+            1,
+            1,
+            &spec.program,
+            &spec.cwd,
+        )?);
         if root
             .split_leaf(self.focused_id, dir, new_id, placeholder)
             .is_ok()
@@ -751,12 +768,8 @@ impl Scope {
     pub fn new_tab_with_spec(&mut self, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let term = ProjectionTerm::with_command(
-                inner.width,
-                inner.height,
-                &spec.program,
-                &spec.cwd,
-            )?;
+            let term =
+                ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
             let id = self.next_id;
             self.next_id += 1;
             self.root = Some(TileNode::Leaf {
@@ -770,12 +783,13 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder =
-            Projection::Term(ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?);
-        if root
-            .new_tab(self.focused_id, new_id, placeholder)
-            .is_ok()
-        {
+        let placeholder = Projection::Term(ProjectionTerm::with_command(
+            1,
+            1,
+            &spec.program,
+            &spec.cwd,
+        )?);
+        if root.new_tab(self.focused_id, new_id, placeholder).is_ok() {
             self.focused_id = new_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);
             self.resize(self.area)?;
@@ -949,12 +963,30 @@ mod tests {
             (2, Rect::new(50, 0, 50, 40), true),
         ];
 
-        assert_eq!(find_neighbor(&rects, 0, rects[0].1, NavDirection::Down), Some(1));
-        assert_eq!(find_neighbor(&rects, 1, rects[1].1, NavDirection::Up), Some(0));
-        assert_eq!(find_neighbor(&rects, 0, rects[0].1, NavDirection::Right), Some(2));
-        assert_eq!(find_neighbor(&rects, 1, rects[1].1, NavDirection::Right), Some(2));
-        assert_eq!(find_neighbor(&rects, 2, rects[2].1, NavDirection::Left), Some(0));
-        assert_eq!(find_neighbor(&rects, 0, rects[0].1, NavDirection::Left), None);
+        assert_eq!(
+            find_neighbor(&rects, 0, rects[0].1, NavDirection::Down),
+            Some(1)
+        );
+        assert_eq!(
+            find_neighbor(&rects, 1, rects[1].1, NavDirection::Up),
+            Some(0)
+        );
+        assert_eq!(
+            find_neighbor(&rects, 0, rects[0].1, NavDirection::Right),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&rects, 1, rects[1].1, NavDirection::Right),
+            Some(2)
+        );
+        assert_eq!(
+            find_neighbor(&rects, 2, rects[2].1, NavDirection::Left),
+            Some(0)
+        );
+        assert_eq!(
+            find_neighbor(&rects, 0, rects[0].1, NavDirection::Left),
+            None
+        );
     }
 
     #[test]
@@ -1005,7 +1037,9 @@ mod tests {
     #[test]
     fn new_tab_wraps_leaf_and_switch_tab_moves_active() {
         let cwd = std::env::temp_dir();
-        let mut scope = Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd).unwrap();
+        let mut scope =
+            Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
+                .unwrap();
         assert_eq!(scope.leaf_count(), 1);
 
         let spec = ScopeSpec::default_zsh(cwd);
@@ -1023,7 +1057,9 @@ mod tests {
     #[test]
     fn new_tab_adds_page_to_existing_tab_group() {
         let cwd = std::env::temp_dir();
-        let mut scope = Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd).unwrap();
+        let mut scope =
+            Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
+                .unwrap();
         let spec = ScopeSpec::default_zsh(cwd.clone());
 
         scope.new_tab_with_spec(&spec).unwrap();

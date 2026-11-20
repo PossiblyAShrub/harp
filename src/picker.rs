@@ -247,7 +247,11 @@ impl Widget for &ScopePicker {
             .iter()
             .enumerate()
             .map(|(i, opt)| {
-                let prefix = if i == self.selected_program { "> " } else { "  " };
+                let prefix = if i == self.selected_program {
+                    "> "
+                } else {
+                    "  "
+                };
                 let style = if i == self.selected_program {
                     Style::default()
                         .fg(Color::Black)
@@ -263,7 +267,11 @@ impl Widget for &ScopePicker {
             })
             .collect();
         List::new(items)
-            .block(Block::bordered().title(" Program ").border_style(prog_border))
+            .block(
+                Block::bordered()
+                    .title(" Program ")
+                    .border_style(prog_border),
+            )
             .render(chunks[1], buf);
 
         let cwd_border = if self.field == PickerField::Cwd {
@@ -300,12 +308,9 @@ impl Widget for &ScopePicker {
         }
 
         if let Some(err) = &self.error {
-            Paragraph::new(Span::styled(
-                err.as_str(),
-                Style::default().fg(Color::Red),
-            ))
-            .wrap(Wrap { trim: true })
-            .render(chunks[3], buf);
+            Paragraph::new(Span::styled(err.as_str(), Style::default().fg(Color::Red)))
+                .wrap(Wrap { trim: true })
+                .render(chunks[3], buf);
         }
 
         Paragraph::new(Span::styled(

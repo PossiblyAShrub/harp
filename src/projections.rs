@@ -62,10 +62,7 @@ impl ProjectionStatus {
 
 impl Widget for &ProjectionStatus {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let scope_label = self
-            .scope_name
-            .as_deref()
-            .map(|name| format!(" {name} "));
+        let scope_label = self.scope_name.as_deref().map(|name| format!(" {name} "));
         let right_width = scope_label
             .as_ref()
             .map_or(0, |s| s.chars().count().min(area.width as usize) as u16);
@@ -266,7 +263,10 @@ impl ProjectionTerm {
         let (mode, encoding) = {
             let parser = self.parser.lock().unwrap();
             let screen = parser.screen();
-            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
         };
 
         if let Some(bytes) = encode_mouse_event(mouse_event, mode, encoding) {
@@ -298,7 +298,11 @@ impl ProjectionTerm {
             return Ok(());
         }
 
-        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
         self.master
             .resize(PtySize {
                 rows,
@@ -409,7 +413,13 @@ fn encode_key_event(key_event: KeyEvent, application_cursor: bool) -> Option<Vec
             }
             out.push(0x00);
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home | KeyCode::End | KeyCode::KeypadBegin => {
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::KeypadBegin => {
             let letter = match key_event.code {
                 KeyCode::Up => 'A',
                 KeyCode::Down => 'B',
@@ -641,7 +651,10 @@ mod tests {
         );
         assert_eq!(
             encode_key_event(
-                key(KeyCode::Char('c'), KeyModifiers::CONTROL | KeyModifiers::ALT),
+                key(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT
+                ),
                 false
             ),
             Some(vec![0x1b, 0x03])
@@ -768,11 +781,19 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(
-            encode_mouse_event(up, MouseProtocolMode::PressRelease, MouseProtocolEncoding::Sgr),
+            encode_mouse_event(
+                up,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr
+            ),
             Some(b"\x1b[<0;10;5m".to_vec())
         );
         assert_eq!(
-            encode_mouse_event(up, MouseProtocolMode::PressRelease, MouseProtocolEncoding::Default),
+            encode_mouse_event(
+                up,
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default
+            ),
             Some(vec![0x1b, b'[', b'M', 35, 42, 37])
         );
     }

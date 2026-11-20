@@ -43,9 +43,7 @@ pub fn parse_harp_file(contents: &str) -> Vec<ProgramOption> {
             continue;
         }
 
-        let split = line
-            .split_once('=')
-            .or_else(|| line.split_once(':'));
+        let split = line.split_once('=').or_else(|| line.split_once(':'));
 
         let (label, program) = match split {
             Some((left, right)) => (left.trim(), strip_quotes(right.trim())),
