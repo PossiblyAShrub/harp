@@ -1,7 +1,10 @@
-use std::{collections::HashMap, io, path::PathBuf, time::Duration};
+use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -540,6 +543,12 @@ fn main() -> Result<()> {
 
     let client = server::connect_or_spawn(&addr)?;
     ratatui::run(|terminal| {
+        // Without these sequences the terminal never reports mouse events, so
+        // nothing could be forwarded to projections. The guard restores mouse
+        // reporting on both normal and error/panic exits.
+        execute!(io::stdout(), EnableMouseCapture).map_err(io::Error::other)?;
+        let _capture = MouseCaptureGuard;
+
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
         let mut app = App::new(client, area).map_err(io::Error::other)?;
@@ -547,4 +556,15 @@ fn main() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Disables terminal mouse capture when dropped so that panics and early
+/// returns leave the shell with normal mouse reporting restored.
+struct MouseCaptureGuard;
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = io::stdout().flush();
+    }
 }

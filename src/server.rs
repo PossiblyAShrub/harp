@@ -172,6 +172,7 @@ impl ServerState {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
+                let before = entry.scope.revision();
                 if let Err(e) = entry.scope.handle_event(&event) {
                     return ServerMsg::Error(e.to_string());
                 }
@@ -180,6 +181,12 @@ impl ServerState {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
+                // Mouse motion or events a pane doesn't want may change nothing;
+                // avoid shipping a full snapshot for those. The client's next
+                // Poll picks up any deferred screen changes.
+                if entry.scope.revision() == before {
+                    return ServerMsg::Unchanged;
+                }
                 let name = entry.name.clone();
                 match entry.scope.snapshot(scope_id, name) {
                     Some(s) => ServerMsg::Snapshot(s),

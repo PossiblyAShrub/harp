@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{Event, MouseEvent};
+use crossterm::event::{Event, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     widgets::Block,
@@ -810,18 +810,41 @@ impl Scope {
 
                 for (id, rect, bordered) in rects {
                     let target = if bordered { pane_inner(rect) } else { rect };
-                    if target.contains(pos) {
-                        let translated = MouseEvent {
-                            column: mouse_event.column - target.x,
-                            row: mouse_event.row - target.y,
-                            ..*mouse_event
-                        };
+                    if !target.contains(pos) {
+                        continue;
+                    }
+
+                    let translated = MouseEvent {
+                        column: mouse_event.column - target.x,
+                        row: mouse_event.row - target.y,
+                        ..*mouse_event
+                    };
+
+                    // Forward the event to the pane under the pointer. The pane
+                    // decides whether to deliver it based on the mouse protocol
+                    // mode it requested (clicks for most apps, motion only when
+                    // the app asked for it).
+                    if let Some(proj) = root.find_mut(id) {
+                        proj.handle_mouse_event(translated)?;
+                    }
+
+                    // Focus a pane on press and wheel events, but not on plain
+                    // pointer motion or drags, so hovering never steals focus
+                    // and a drag that strays across panes doesn't flip focus
+                    // mid-gesture.
+                    let activates = matches!(
+                        mouse_event.kind,
+                        MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight
+                    );
+                    if activates && self.focused_id != id {
                         self.focused_id = id;
                         self.layout_revision = self.layout_revision.wrapping_add(1);
-                        if let Some(proj) = root.find_mut(id) {
-                            return proj.handle_mouse_event(translated);
-                        }
                     }
+                    return Ok(());
                 }
                 Ok(())
             }
@@ -938,6 +961,45 @@ mod tests {
     fn pane_inner_accounts_for_borders() {
         let rect = Rect::new(50, 0, 50, 40);
         assert_eq!(pane_inner(rect), Rect::new(51, 1, 48, 38));
+    }
+
+    #[test]
+    fn mouse_press_focuses_pane_under_cursor_but_hover_does_not() {
+        let cwd = std::env::temp_dir();
+        let mut scope =
+            Scope::with_terminals_in(2, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
+                .unwrap();
+        assert_eq!(scope.focused_id, 0);
+
+        // Pressing inside the right-hand pane moves focus there.
+        let press = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 50,
+            row: 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        scope.handle_event(&press).unwrap();
+        assert_eq!(scope.focused_id, 1);
+
+        // Hovering back over the first pane leaves focus untouched.
+        let hover = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 5,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        scope.handle_event(&hover).unwrap();
+        assert_eq!(scope.focused_id, 1);
+
+        // A scroll over the first pane both forwards and focuses it.
+        let scroll = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        scope.handle_event(&scroll).unwrap();
+        assert_eq!(scope.focused_id, 0);
     }
 
     #[test]
