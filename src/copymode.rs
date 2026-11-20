@@ -37,6 +37,8 @@ pub struct CopyMode {
     cursor_row: u16,
     /// Start of the selection; `None` until the user anchors it with Space.
     anchor: Option<(u16, u16)>,
+    dragging: bool,
+    mouse_selection: bool,
 }
 
 impl CopyMode {
@@ -56,7 +58,43 @@ impl CopyMode {
             cursor_col: 0,
             cursor_row: 0,
             anchor: None,
+            dragging: false,
+            mouse_selection: false,
         })
+    }
+
+    /// Starts a mouse selection at a pane-local cell.
+    pub fn mouse_down(&mut self, col: u16, row: u16) {
+        self.mouse_selection = true;
+        self.cursor_col = col.min(self.cols.saturating_sub(1));
+        self.cursor_row = row.min(self.rows.saturating_sub(1));
+        self.anchor = Some((self.cursor_col, self.cursor_row));
+        self.dragging = true;
+    }
+
+    /// Extends an active mouse selection to a pane-local cell.
+    pub fn mouse_move(&mut self, col: u16, row: u16) {
+        if self.dragging {
+            self.cursor_col = col.min(self.cols.saturating_sub(1));
+            self.cursor_row = row.min(self.rows.saturating_sub(1));
+        }
+    }
+
+    /// Finishes a mouse drag while keeping its highlighted selection active.
+    pub fn mouse_up(&mut self) {
+        self.dragging = false;
+    }
+
+    pub fn is_mouse_selection(&self) -> bool {
+        self.mouse_selection
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.anchor.is_some()
     }
 
     /// Handles a single key event, updating movement / the selection.
@@ -68,19 +106,11 @@ impl CopyMode {
             return CopyAction::None;
         }
 
-        let ctrl_shift = key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.modifiers.contains(KeyModifiers::SHIFT);
-
         match key.code {
             KeyCode::Char(' ') if key.modifiers == KeyModifiers::NONE => {
                 self.anchor = Some((self.cursor_col, self.cursor_row));
             }
             KeyCode::Enter if key.kind == KeyEventKind::Press => return CopyAction::CopyAndExit,
-            KeyCode::Char('c') | KeyCode::Char('C')
-                if ctrl_shift && key.kind == KeyEventKind::Press =>
-            {
-                return CopyAction::CopyAndExit;
-            }
             KeyCode::Char('q') | KeyCode::Esc
                 if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE =>
             {
@@ -226,21 +256,26 @@ fn cell_style(cell: &vt100::Cell, selected: bool, is_cursor: bool) -> Style {
 
 impl Widget for &CopyMode {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered()
-            .title(Span::styled(
-                " COPY ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .title_bottom(Line::from(Span::styled(
-                " Space: select | Arrows: move | Home/End: line | PgUp/PgDn: edge | Enter or Ctrl+Shift+C: copy | q or Esc: quit ",
-                Style::default().fg(Color::Gray),
-            )))
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let inner = if self.mouse_selection {
+            area
+        } else {
+            let block = Block::bordered()
+                .title(Span::styled(
+                    " COPY ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Line::from(Span::styled(
+                    " Space: select | Arrows: move | Home/End: line | PgUp/PgDn: edge | Enter or Ctrl+Shift+C: copy | q or Esc: quit ",
+                    Style::default().fg(Color::Gray),
+                )))
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(area);
+            block.render(area, buf);
+            inner
+        };
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -321,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn space_anchors_and_ctrl_shift_c_copies() {
+    fn space_anchors_and_enter_copies() {
         let parser = screen("hello world", 1, 16);
         let mut cm = CopyMode::new(0, &parser).unwrap();
         assert_eq!(
@@ -331,10 +366,7 @@ mod tests {
         cm.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         cm.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(
-            cm.handle_key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT
-            )),
+            cm.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             CopyAction::CopyAndExit
         );
         assert_eq!(cm.copy_text(), "hel");

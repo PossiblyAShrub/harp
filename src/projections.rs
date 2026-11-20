@@ -97,7 +97,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Green)
                         .add_modifier(Modifier::BOLD),
-                    " Ctrl+Space: manage | Ctrl+Shift+C: copy | Ctrl+Shift+V: paste",
+                    " Ctrl+Space: manage | App keys pass through",
                 ),
                 Mode::Managing => (
                     " MANAGING ",
@@ -105,7 +105,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                    " Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
+                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
                 ),
             };
 
@@ -767,6 +767,34 @@ fn encode_ctrl_char(c: char) -> Option<u8> {
     }
 }
 
+fn shifted_char(c: char) -> Option<char> {
+    Some(match c {
+        'a'..='z' => c.to_ascii_uppercase(),
+        '0' => ')',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '`' => '~',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => return None,
+    })
+}
+
 fn encode_key_event(key_event: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
@@ -781,6 +809,11 @@ fn encode_key_event(key_event: KeyEvent, application_cursor: bool) -> Option<Vec
 
     match key_event.code {
         KeyCode::Char(c) => {
+            let c = if shift {
+                shifted_char(c).unwrap_or(c)
+            } else {
+                c
+            };
             if alt {
                 out.push(0x1b);
             }

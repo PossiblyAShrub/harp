@@ -2,13 +2,14 @@ use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     prelude::Buffer,
     widgets::Widget,
 };
@@ -35,7 +36,7 @@ use protocol::{
 };
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
-use view::{SnapshotView, pane_at};
+use view::{SnapshotView, pane_at, pane_content_rect};
 
 struct App {
     client: EncryptedStream,
@@ -279,36 +280,6 @@ impl App {
         Ok(())
     }
 
-    /// True when a key event is the `Ctrl+Shift+C` copy-mode shortcut.
-    fn is_copy_shortcut(key_event: &KeyEvent) -> bool {
-        key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && key_event.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    }
-
-    /// True when a key event is the `Ctrl+Shift+V` paste shortcut.
-    fn is_paste_shortcut(key_event: &KeyEvent) -> bool {
-        key_event.modifiers.contains(KeyModifiers::CONTROL)
-            && key_event.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key_event.code, KeyCode::Char('v') | KeyCode::Char('V'))
-    }
-
-    /// Enters copy mode over the currently focused projection, if any.
-    fn enter_copy_mode(&mut self) {
-        if self.copy_mode.is_some() {
-            return;
-        }
-        let Some(snap) = &self.snapshot else {
-            return;
-        };
-        let Some(parser) = self.parsers.get(&snap.focused_id) else {
-            return;
-        };
-        if let Some(mode) = CopyMode::new(snap.focused_id, parser) {
-            self.copy_mode = Some(mode);
-        }
-    }
-
     /// Pastes the OS clipboard into the focused projection.
     ///
     /// Reading the clipboard keeps the paste entirely inside harp, so the
@@ -428,6 +399,39 @@ impl App {
             return Ok(());
         }
 
+        if let Event::Paste(text) = event {
+            self.copy_mode = None;
+            return self.forward_event(Event::Paste(text.clone()));
+        }
+
+        if let Event::Mouse(mouse) = event {
+            let pane_id = self.copy_mode.as_ref().map(|mode| mode.pane_id);
+            let content = pane_id.and_then(|id| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|snap| pane_content_rect(&snap.root, self.workspace_area, id))
+            });
+            if let Some(content) = content {
+                let col = mouse
+                    .column
+                    .saturating_sub(content.x)
+                    .min(content.width.saturating_sub(1));
+                let row = mouse
+                    .row
+                    .saturating_sub(content.y)
+                    .min(content.height.saturating_sub(1));
+                if let Some(mode) = &mut self.copy_mode {
+                    match mouse.kind {
+                        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                        | MouseEventKind::Moved => mode.mouse_move(col, row),
+                        MouseEventKind::Up(crossterm::event::MouseButton::Left) => mode.mouse_up(),
+                        _ => {}
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let mut leave = CopyLeave::Stay;
         let mut copied: Option<String> = None;
 
@@ -464,6 +468,41 @@ impl App {
         Ok(())
     }
 
+    /// Starts a highlighted mouse selection on a pane whose app has not
+    /// requested mouse input. Apps with mouse reporting keep their clicks.
+    fn start_mouse_selection(&mut self, mouse: MouseEvent) -> bool {
+        if mouse.kind != MouseEventKind::Down(crossterm::event::MouseButton::Left) {
+            return false;
+        }
+        let Some(snap) = &self.snapshot else {
+            return false;
+        };
+        let Some(id) = pane_at(&snap.root, self.workspace_area, mouse.column, mouse.row) else {
+            return false;
+        };
+        let app_owns_mouse = self.parsers.get(&id).is_some_and(|parser| {
+            parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        });
+        if self.pane_in_alternate_screen(id) || app_owns_mouse {
+            return false;
+        }
+        let Some(content) = pane_content_rect(&snap.root, self.workspace_area, id) else {
+            return false;
+        };
+        if !content.contains(Position::new(mouse.column, mouse.row)) {
+            return false;
+        }
+        let Some(parser) = self.parsers.get(&id) else {
+            return false;
+        };
+        let Some(mut mode) = CopyMode::new(id, parser) else {
+            return false;
+        };
+        mode.mouse_down(mouse.column - content.x, mouse.row - content.y);
+        self.copy_mode = Some(mode);
+        true
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.render(frame))?;
@@ -493,7 +532,11 @@ impl App {
         loop {
             let event = event::read()?;
 
-            if self.copy_mode.is_some() {
+            if self
+                .copy_mode
+                .as_ref()
+                .is_some_and(|mode| !mode.is_mouse_selection() || mode.is_dragging())
+            {
                 self.handle_copy_mode_event(&event)?;
             } else if let Event::Resize(cols, rows) = event {
                 self.workspace_area = Rect::new(0, 0, cols.max(1), rows.saturating_sub(1).max(1));
@@ -599,6 +642,28 @@ impl App {
                         }
                     }
                 }
+            } else if let Event::Mouse(mouse) = &event
+                && self.start_mouse_selection(*mouse)
+            {
+                // The selection overlay owns the drag until mouse-up.
+            } else if let Event::Key(key) = &event
+                && key.kind == KeyEventKind::Press
+                && key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Char('c'))
+                && self.copy_mode.as_ref().is_some_and(CopyMode::has_selection)
+            {
+                if let Some(selection) = &self.copy_mode {
+                    clipboard::clipboard_set(&selection.copy_text());
+                }
+            } else if let Event::Key(key) = &event
+                && key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Esc
+                && self
+                    .copy_mode
+                    .as_ref()
+                    .is_some_and(CopyMode::is_mouse_selection)
+            {
+                self.copy_mode = None;
             } else {
                 match self.mode {
                     Mode::Interacting => match &event {
@@ -610,18 +675,6 @@ impl App {
                                 && key_event.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
                             self.set_mode(Mode::Managing);
-                        }
-                        Event::Key(key_event)
-                            if key_event.kind == KeyEventKind::Press
-                                && Self::is_paste_shortcut(key_event) =>
-                        {
-                            self.paste_from_clipboard()?;
-                        }
-                        Event::Key(key_event)
-                            if key_event.kind == KeyEventKind::Press
-                                && Self::is_copy_shortcut(key_event) =>
-                        {
-                            self.enter_copy_mode();
                         }
                         Event::Mouse(mouse_event)
                             if matches!(
@@ -670,6 +723,14 @@ impl App {
                         }
                     },
                     Mode::Managing => match &event {
+                        Event::Paste(_) => self.forward_event(event)?,
+                        Event::Key(key_event)
+                            if key_event.kind == KeyEventKind::Press
+                                && key_event.code == KeyCode::Char('v')
+                                && key_event.modifiers == KeyModifiers::NONE =>
+                        {
+                            self.paste_from_clipboard()?;
+                        }
                         Event::Key(key_event)
                             if matches!(
                                 key_event.kind,
@@ -677,15 +738,7 @@ impl App {
                             ) =>
                         {
                             self.status.set_error(None);
-                            if key_event.kind == KeyEventKind::Press
-                                && Self::is_copy_shortcut(key_event)
-                            {
-                                self.enter_copy_mode();
-                            } else if key_event.kind == KeyEventKind::Press
-                                && Self::is_paste_shortcut(key_event)
-                            {
-                                self.paste_from_clipboard()?;
-                            } else if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                            if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
                                 && key_event.modifiers == KeyModifiers::NONE
                             {
                                 let focused = self.snapshot.as_ref().map(|s| s.focused_id);
@@ -821,7 +874,15 @@ impl Widget for &App {
         self.status.render(chunks[1], buf);
 
         if let Some(copy_mode) = &self.copy_mode {
-            copy_mode.render(chunks[0], buf);
+            if copy_mode.is_mouse_selection() {
+                if let Some(snap) = &self.snapshot
+                    && let Some(area) = pane_content_rect(&snap.root, chunks[0], copy_mode.pane_id)
+                {
+                    copy_mode.render(area, buf);
+                }
+            } else {
+                copy_mode.render(chunks[0], buf);
+            }
         }
 
         if let Some(picker) = &self.picker {
@@ -1004,7 +1065,17 @@ fn main() -> Result<()> {
         // Without these sequences the terminal never reports mouse events, so
         // nothing could be forwarded to projections. The guard restores mouse
         // reporting on both normal and error/panic exits.
-        execute!(io::stdout(), EnableMouseCapture).map_err(io::Error::other)?;
+        execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+        )
+        .map_err(io::Error::other)?;
         let _capture = MouseCaptureGuard;
 
         let size = terminal.size()?;
@@ -1022,7 +1093,12 @@ struct MouseCaptureGuard;
 
 impl Drop for MouseCaptureGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
+        );
         let _ = io::stdout().flush();
     }
 }

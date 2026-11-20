@@ -114,6 +114,39 @@ pub fn pane_at(node: &SnapshotNode, area: Rect, x: u16, y: u16) -> Option<usize>
     }
 }
 
+/// Returns the terminal cell area rendered for a pane, matching
+/// [`SnapshotView::render_node`] so mouse coordinates map to parser cells.
+pub fn pane_content_rect(node: &SnapshotNode, area: Rect, id: usize) -> Option<Rect> {
+    match node {
+        SnapshotNode::Leaf { id: leaf_id, .. } if *leaf_id == id => {
+            Some(Block::bordered().inner(area))
+        }
+        SnapshotNode::Leaf { .. } => None,
+        SnapshotNode::Split {
+            direction,
+            children,
+        } => {
+            let dir = match direction {
+                SplitDir::Horizontal => Direction::Horizontal,
+                SplitDir::Vertical => Direction::Vertical,
+            };
+            let constraints: Vec<Constraint> = children
+                .iter()
+                .map(|child| Constraint::Fill(child.fill))
+                .collect();
+            let rects = Layout::new(dir, constraints).split(area);
+            children
+                .iter()
+                .zip(rects.iter())
+                .find_map(|(child, rect)| pane_content_rect(&child.node, *rect, id))
+        }
+        SnapshotNode::Tabs { pages, active } => pages
+            .get(*active)
+            .filter(|page| page.id == id)
+            .map(|_| Block::bordered().inner(area)),
+    }
+}
+
 fn render_tab_bar_line(pages: &[TabPageSnapshot], active: usize) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (i, page) in pages.iter().enumerate() {
