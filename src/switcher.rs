@@ -24,10 +24,10 @@ pub struct ScopeSwitcher {
 }
 
 impl ScopeSwitcher {
-    pub fn new(scopes: Vec<ScopeInfo>, allow_cancel: bool) -> Self {
+    pub fn new(scopes: Vec<ScopeInfo>, selected: usize, allow_cancel: bool) -> Self {
         Self {
             scopes,
-            selected: 0,
+            selected,
             allow_cancel,
         }
     }

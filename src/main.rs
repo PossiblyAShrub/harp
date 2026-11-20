@@ -76,7 +76,7 @@ impl App {
                 app.create_new_scope()?;
             }
             ServerMsg::Scopes(scopes) => {
-                app.switcher = Some(ScopeSwitcher::new(scopes, false));
+                app.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
             }
             ServerMsg::Error(e) => {
                 app.status.set_error(Some(e));
@@ -145,7 +145,7 @@ impl App {
                 match self.client.recv::<ServerMsg>()? {
                     ServerMsg::Scopes(scopes) if !scopes.is_empty() => {
                         self.set_mode(Mode::Managing);
-                        self.switcher = Some(ScopeSwitcher::new(scopes, false));
+                        self.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
                     }
                     _ => {
                         self.exit = true;
@@ -184,7 +184,9 @@ impl App {
         self.client.send(&ClientMsg::ListScopes)?;
         match self.client.recv::<ServerMsg>()? {
             ServerMsg::Scopes(scopes) => {
-                self.switcher = Some(ScopeSwitcher::new(scopes, allow_cancel));
+                let scope_id = self.snapshot.as_ref().map(|s| s.scope_id);
+                let scope_num = scopes.iter().enumerate().find(|(_, s)| Some(s.id) == scope_id).map(|(num, _)| num).unwrap_or(0);
+                self.switcher = Some(ScopeSwitcher::new(scopes, scope_num, allow_cancel));
             }
             ServerMsg::Error(e) => self.status.set_error(Some(e)),
             _ => {}
