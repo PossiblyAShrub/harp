@@ -65,26 +65,6 @@ your client while a scope continues in the background.
 Projections are individual applications that live in a scope. They may be a
 terminal, an editor, or a custom tool that belongs to a workspace.
 
-### Scrollback
-
-Terminal panes keep up to 1000 rows of scrollback on the main screen. Scroll a
-pane with the mouse wheel, or page the focused pane with `PgUp`/`PgDn`; typing
-or clicking returns the view to the bottom. Programs on their alternate screen
-(`vim`, `less`, `htop`, ...) get wheel and `PgUp`/`PgDn` events passed through
-instead, and scroll themselves. Scroll back in a pane and hit `Ctrl+Shift+C`
-to select and copy text from history.
-
-### Terminal graphics (kitty image protocol)
-
-Programs that use the kitty graphics protocol — `kitty +kitten icat`,
-`chafa --format=kitty`, `viu`, and so on — work inside terminal panes. Harp
-reports the real terminal's character cell size in pixels through the PTY's
-`TIOCGWINSZ` (and answers `CSI 14 t` / `CSI 16 t` size queries), and forwards
-the graphics escape sequences through to the terminal emulator for display.
-On startup the client asks the terminal for its cell size; if the terminal
-doesn't answer (not kitty/wezterm/xterm-like), pixel sizes stay unset and image
-tools fall back to their own error handling.
-
 ### `.harp` Configuration
 
 Launcher programs are discovered from `.harp` files in the following order

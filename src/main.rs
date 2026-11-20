@@ -1003,4 +1003,208 @@ mod tests {
         assert_eq!(parse_pixel_response(b"\x1b[6;23", b'6'), None);
         assert_eq!(parse_pixel_response(b"nothing here", b'6'), None);
     }
+
+    #[test]
+    fn slice_contains_works() {
+        let state = b"\x1b[?25h\x1b_Gi=1;OK\x1b\\\x1b[?1;2c";
+        assert!(slice_contains(state, b"\x1b[?1;2c"), "da not found");
+        assert!(slice_contains(state, b"\x1b_Gi=1;OK\x1b\\"), "ok not found");
+        let root = SnapshotNode::Leaf {
+            id: 1,
+            cols: 10,
+            rows: 10,
+            state: state.to_vec(),
+            scrollback: Vec::new(),
+        };
+        assert!(
+            root_has_raw_state(&root, &|s: &[u8]| slice_contains(s, b"\x1b[?1;2c")),
+            "root da not found"
+        );
+    }
+
+    #[test]
+    fn repro_large_image_end_to_end() {
+        use std::net::TcpStream;
+        use std::time::Duration;
+
+        let port = 7500 + (std::process::id() % 1000) as u16;
+        let addr = format!("127.0.0.1:{port}");
+        let script_path = std::env::temp_dir().join("harp_e2e_img.sh");
+        let script = r#"#!/bin/bash
+# Mimic icat's support detection: emit graphics capability probes (direct /
+# file / shm query) plus a device-attributes query, then wait. The tty echoes
+# the server's replies into the pane's screen, so the test can verify them.
+python3 - <<'PY'
+import sys
+sys.stdout.buffer.write(b"\x1b_Ga=q,i=1,t=d,s=1,v=1,f=24,S=3;MTIz\x1b\\")
+sys.stdout.buffer.write(b"\x1b_Ga=q,i=2,t=t,s=1,v=1,f=24,S=3;MTIz\x1b\\")
+sys.stdout.buffer.write(b"\x1b_Ga=q,i=3,t=s,s=1,v=1,f=24,S=3;MTIz\x1b\\")
+sys.stdout.buffer.write(b"\x1b[c")
+sys.stdout.flush()
+PY
+sleep 30
+echo E2E_DONE
+"#;
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let server_addr = addr.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::run_server(&server_addr);
+        });
+        // Wait for the server to accept.
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stream = stream.expect("server did not start");
+        let mut client = crate::crypto::EncryptedStream::handshake_client(stream).unwrap();
+
+        client
+            .send(&ClientMsg::SetPixelSize {
+                cell_w: 12,
+                cell_h: 24,
+            })
+            .unwrap();
+        let _ = client.recv::<ServerMsg>();
+
+        let cwd = std::env::temp_dir();
+        client
+            .send(&ClientMsg::CreateScope {
+                cwd: cwd.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .unwrap();
+        match client.recv::<ServerMsg>().unwrap() {
+            ServerMsg::Snapshot(_) => {}
+            other => panic!("expected snapshot on create, got {other:?}"),
+        }
+
+        // Split to run the image script in a fresh pane.
+        client
+            .send(&ClientMsg::Split {
+                scope_id: 1,
+                dir: NavDir::Left,
+                spec: RemoteScopeSpec {
+                    machine: "localhost".into(),
+                    cwd: cwd.clone(),
+                    program: script_path.display().to_string(),
+                },
+            })
+            .unwrap();
+        match client.recv::<ServerMsg>().unwrap() {
+            ServerMsg::Snapshot(_) => {}
+            other => panic!("expected snapshot on split, got {other:?}"),
+        }
+
+        // Poll until the probe responses reach the child's screen.
+        let start = std::time::Instant::now();
+        let mut total_passthrough = 0usize;
+        let mut last_snap: Option<ScopeSnapshot> = None;
+        loop {
+            if start.elapsed() > Duration::from_secs(10) {
+                let mut dumps = Vec::new();
+                if let Some(snap) = &last_snap {
+                    dump_leaf_states(&mut dumps, &snap.root);
+                }
+                panic!(
+                    "TIMED OUT waiting for probe responses; passthrough={total_passthrough}; states={dumps:?}"
+                );
+            }
+            client
+                .send(&ClientMsg::Poll {
+                    scope_id: 1,
+                    last_revision: 0,
+                })
+                .unwrap();
+            match client.recv::<ServerMsg>().unwrap() {
+                ServerMsg::Snapshot(snap) => {
+                    total_passthrough += snap.passthrough.len();
+                    last_snap = Some(snap.clone());
+                    let hit_verdict = root_has_leaf_state(&snap.root, &|text: &str| {
+                        text.contains("Gi=1;OK") && text.contains("?1;2c")
+                    });
+                    if hit_verdict {
+                        // The replies were echoed into the pane's screen, which
+                        // proves they were delivered into the pty. Check that
+                        // direct was OK'ed and file/shm rejected.
+                        let ok_and_ebadf = root_has_leaf_state(&snap.root, &|text: &str| {
+                            text.contains("Gi=1;OK")
+                                && text.contains("Gi=2;EBADF")
+                                && text.contains("Gi=3;EBADF")
+                        });
+                        eprintln!(
+                            "completed at {:?} with {} passthrough bytes, ok={ok_and_ebadf}",
+                            start.elapsed(),
+                            total_passthrough
+                        );
+                        assert!(
+                            ok_and_ebadf,
+                            "server must answer direct OK and reject file/shm"
+                        );
+                        break;
+                    }
+                }
+                ServerMsg::Unchanged => {}
+                other => panic!("unexpected reply {other:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// Whether any leaf in the snapshot tree satisfies `pred` over its visible
+    /// screen text.
+    fn root_has_leaf_state(root: &SnapshotNode, pred: &dyn Fn(&str) -> bool) -> bool {
+        match root {
+            SnapshotNode::Leaf { state, .. } => pred(&String::from_utf8_lossy(state)),
+            SnapshotNode::Split { children, .. } => {
+                children.iter().any(|c| root_has_leaf_state(&c.node, pred))
+            }
+            SnapshotNode::Tabs { pages, .. } => pages
+                .iter()
+                .any(|p| pred(&String::from_utf8_lossy(&p.state))),
+        }
+    }
+
+    /// Collects the visible text of every leaf in the snapshot tree.
+    fn dump_leaf_states(out: &mut Vec<String>, root: &SnapshotNode) {
+        match root {
+            SnapshotNode::Leaf { state, .. } => {
+                out.push(String::from_utf8_lossy(state).into_owned());
+            }
+            SnapshotNode::Split { children, .. } => {
+                for c in children {
+                    dump_leaf_states(out, &c.node);
+                }
+            }
+            SnapshotNode::Tabs { pages, .. } => {
+                for p in pages {
+                    out.push(String::from_utf8_lossy(&p.state).into_owned());
+                }
+            }
+        }
+    }
+
+    /// Whether any leaf's raw screen bytes satisfy `pred`.
+    fn root_has_raw_state(root: &SnapshotNode, pred: &dyn Fn(&[u8]) -> bool) -> bool {
+        match root {
+            SnapshotNode::Leaf { state, .. } => pred(state),
+            SnapshotNode::Split { children, .. } => {
+                children.iter().any(|c| root_has_raw_state(&c.node, pred))
+            }
+            SnapshotNode::Tabs { pages, .. } => pages.iter().any(|p| pred(&p.state)),
+        }
+    }
+
+    fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
 }

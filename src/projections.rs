@@ -531,9 +531,13 @@ impl PassthroughFilter {
                 mut private,
             } => {
                 if (0x40..=0x7e).contains(&b) {
-                    // Final byte: answer known size queries, forward the rest
-                    // to the screen parser untouched.
-                    if !private && self.answer_size_query(&params, b, cell_px, size, responses) {
+                    // Final byte. Answer terminal queries here (the real
+                    // terminal's replies can't be relayed back through the
+                    // client), forward everything else to the screen parser.
+                    if !private
+                        && let Some(response) = device_query_response(&params, b, cell_px, size)
+                    {
+                        responses.extend_from_slice(&response);
                         self.state = FilterState::Normal;
                     } else {
                         screen.extend_from_slice(b"\x1b[");
@@ -552,12 +556,15 @@ impl PassthroughFilter {
             FilterState::Apc { mut buf, saw_esc } => {
                 buf.push(b);
                 match (saw_esc, b) {
-                    (true, b'\\') => {
-                        passthrough.extend_from_slice(&buf);
-                        self.state = FilterState::Normal;
-                    }
-                    (false, 0x07) => {
-                        passthrough.extend_from_slice(&buf);
+                    (true, b'\\') | (false, 0x07) => {
+                        // Graphics capability queries are answered here so the
+                        // child doesn't wait forever for a reply that would
+                        // land on the client's stdin.
+                        if let Some(response) = answer_graphics_query(&buf) {
+                            responses.extend_from_slice(&response);
+                        } else {
+                            passthrough.extend_from_slice(&buf);
+                        }
                         self.state = FilterState::Normal;
                     }
                     (_, 0x1b) => {
@@ -596,39 +603,87 @@ impl PassthroughFilter {
             },
         }
     }
+}
 
-    /// Answers `CSI 16 t` (cell size) and `CSI 14 t` (pane size) queries.
-    /// Returns true when the sequence was consumed.
-    fn answer_size_query(
-        &self,
-        params: &[u8],
-        final_byte: u8,
-        cell_px: (u16, u16),
-        size: (u16, u16),
-        responses: &mut Vec<u8>,
-    ) -> bool {
-        if final_byte != b't' {
-            return false;
+/// Builds the response to a terminal query, if it is one that the server can
+/// answer on behalf of the real terminal.
+fn device_query_response(
+    params: &[u8],
+    final_byte: u8,
+    cell_px: (u16, u16),
+    size: (u16, u16),
+) -> Option<Vec<u8>> {
+    match (params, final_byte) {
+        // CSI 16 t: character cell size in pixels.
+        (b"16", b't') => {
+            let (cell_w, cell_h) = cell_px;
+            (cell_w > 0 && cell_h > 0).then(|| format!("\x1b[6;{cell_h};{cell_w}t").into_bytes())
         }
-        let (cell_w, cell_h) = cell_px;
-        if cell_w == 0 || cell_h == 0 {
-            return false;
+        // CSI 14 t: pane size in pixels.
+        (b"14", b't') => {
+            let (cell_w, cell_h) = cell_px;
+            if cell_w == 0 || cell_h == 0 {
+                return None;
+            }
+            let (rows, cols) = size;
+            let w = u32::from(cell_w) * u32::from(cols);
+            let h = u32::from(cell_h) * u32::from(rows);
+            Some(format!("\x1b[4;{h};{w}t").into_bytes())
         }
-        match params {
-            b"16" => {
-                responses.extend_from_slice(format!("\x1b[6;{cell_h};{cell_w}t").as_bytes());
-                true
+        // CSI c: primary device attributes (DA). Answer as a VT100-style
+        // terminal with advanced video, which is what icat's support
+        // detection waits for.
+        (b"", b'c') => Some(b"\x1b[?1;2c".to_vec()),
+        // CSI > ... c: secondary device attributes (DA2).
+        ([b'>', ..], b'c') => Some(b"\x1b[>0;0;0c".to_vec()),
+        _ => None,
+    }
+}
+
+/// Answers a kitty graphics protocol capability query (`a=q`). Direct
+/// transmission is reported as supported; file/shared-memory transmission is
+/// rejected with an error so clients fall back to in-band streaming, which is
+/// the only mechanism that works across the client/server split. Returns
+/// `None` for everything else (transmissions, placements, ...) which should be
+/// passed through to the real terminal.
+fn answer_graphics_query(apc: &[u8]) -> Option<Vec<u8>> {
+    let body = apc.strip_prefix(b"\x1b_G")?;
+    let body = body.strip_suffix(b"\x1b\\")?;
+    let control = match body.iter().position(|&b| b == b';') {
+        Some(p) => &body[..p],
+        None => body,
+    };
+
+    let mut action = None;
+    let mut id: Option<&[u8]> = None;
+    let mut transmission = None;
+    for pair in control.split(|&b| b == b',') {
+        if let Some(eq) = pair.iter().position(|&b| b == b'=') {
+            match &pair[..eq] {
+                b"a" => action = Some(&pair[eq + 1..]),
+                b"i" => id = Some(&pair[eq + 1..]),
+                b"t" => transmission = Some(&pair[eq + 1..]),
+                _ => {}
             }
-            b"14" => {
-                let (rows, cols) = size;
-                let w = u32::from(cell_w) * u32::from(cols);
-                let h = u32::from(cell_h) * u32::from(rows);
-                responses.extend_from_slice(format!("\x1b[4;{h};{w}t").as_bytes());
-                true
-            }
-            _ => false,
         }
     }
+
+    if action? != b"q" {
+        return None;
+    }
+    let is_direct = transmission.is_none_or(|t| t == b"d");
+    let mut response = Vec::new();
+    response.extend_from_slice(b"\x1b_G");
+    if let Some(id) = id {
+        response.extend_from_slice(b"i=");
+        response.extend_from_slice(id);
+    }
+    if is_direct {
+        response.extend_from_slice(b";OK\x1b\\");
+    } else {
+        response.extend_from_slice(b";EBADF:Failed to read image data\x1b\\");
+    }
+    Some(response)
 }
 
 /// Serializes every scrolled-out row of the pane's main screen as plain text
@@ -1279,6 +1334,47 @@ mod tests {
         assert_eq!(responses, b"\x1b[6;24;12t");
         assert!(screen.is_empty());
         assert!(passthrough.is_empty());
+    }
+
+    #[test]
+    fn passthrough_filter_answers_device_attributes() {
+        let (screen, passthrough, responses) = feed_split(&[b"\x1b[c"], (12, 24), (80, 24));
+        assert_eq!(responses, b"\x1b[?1;2c");
+        assert!(screen.is_empty());
+        assert!(passthrough.is_empty());
+    }
+
+    #[test]
+    fn passthrough_filter_answers_graphics_query_but_not_transmissions() {
+        // Direct query (a=q,t=d,i=1) -> OK, not forwarded.
+        let (screen, passthrough, responses) = feed_split(
+            &[b"\x1b_Ga=q,i=1,t=d,s=1,v=1,f=24,S=3;MTIz\x1b\\"],
+            (12, 24),
+            (80, 24),
+        );
+        assert_eq!(responses, b"\x1b_Gi=1;OK\x1b\\");
+        assert!(screen.is_empty());
+        assert!(passthrough.is_empty());
+
+        // File/shared-memory queries -> error (so clients use stream mode).
+        let (_, _, responses) = feed_split(
+            &[b"\x1b_Ga=q,i=2,t=s,s=1,v=1,f=24,S=3;MTIz\x1b\\"],
+            (12, 24),
+            (80, 24),
+        );
+        assert_eq!(
+            responses,
+            b"\x1b_Gi=2;EBADF:Failed to read image data\x1b\\"
+        );
+
+        // A real transmission (a=T) is not a query -> forwarded unchanged.
+        let (_, passthrough, responses) = feed_split(
+            &[b"\x1b_Ga=T,f=100,q=2,s=8,v=8,m=1;AAAA\x1b\\"],
+            (12, 24),
+            (80, 24),
+        );
+        assert_eq!(passthrough, b"\x1b_Ga=T,f=100,q=2,s=8,v=8,m=1;AAAA\x1b\\");
+        assert!(responses.is_empty());
     }
 
     #[test]
