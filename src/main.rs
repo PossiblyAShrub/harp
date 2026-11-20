@@ -104,6 +104,15 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snap: ScopeSnapshot) {
+        // Offsets are measured from the bottom. When new output adds rows to
+        // history, increase a scrolled-up pane's offset by the same amount so
+        // its current content stays anchored instead of drifting toward the
+        // bottom as snapshots arrive.
+        let previous_totals: HashMap<_, _> = self
+            .parsers
+            .iter_mut()
+            .map(|(&id, parser)| (id, total_scrollback(parser)))
+            .collect();
         let mut active_ids = Vec::new();
         self.sync_parsers(&snap.root, &mut active_ids);
         self.parsers.retain(|id, _| active_ids.contains(id));
@@ -114,9 +123,14 @@ impl App {
         // Re-apply each projection's saved scroll position onto its parser.
         // Parsers keep their scrollback offset across polls, so this only
         // matters after a rebuild or a fresh parser.
-        for (id, offset) in &self.scroll {
+        for (id, offset) in &mut self.scroll {
             if let Some(parser) = self.parsers.get_mut(id) {
                 let total = total_scrollback(parser);
+                if *offset > 0 {
+                    let previous = previous_totals.get(id).copied().unwrap_or(total);
+                    *offset = offset.saturating_add(total.saturating_sub(previous));
+                }
+                *offset = (*offset).min(total);
                 parser.screen_mut().set_scrollback((*offset).min(total));
             }
         }
@@ -363,9 +377,9 @@ impl App {
         }
     }
 
-    /// Routes a mouse wheel event: scroll the pane under the pointer when it
-    /// has a main-screen scrollback, otherwise forward the event to the
-    /// program running in it.
+    /// Routes a mouse wheel event: scroll local history on a normal main
+    /// screen, and forward it when the pane is alternate-screen or the app
+    /// has enabled a terminal mouse protocol.
     fn handle_wheel(&mut self, mouse: MouseEvent) -> io::Result<()> {
         let target = self
             .snapshot
@@ -374,7 +388,10 @@ impl App {
         let Some(id) = target else {
             return Ok(());
         };
-        if self.pane_in_alternate_screen(id) {
+        let app_owns_mouse = self.parsers.get(&id).is_some_and(|parser| {
+            parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+        });
+        if self.pane_in_alternate_screen(id) || app_owns_mouse {
             return self.forward_event(Event::Mouse(mouse));
         }
         // offset 0 is the bottom; increasing it moves the view into history.
