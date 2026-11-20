@@ -654,12 +654,15 @@ impl App {
                             }
                         }
                         _ => {
-                            let ignore = matches!(
+                            let key_release = matches!(
                                 &event,
                                 Event::Key(k) if k.kind == KeyEventKind::Release
                             );
-                            if !ignore {
-                                if let Some(id) = self.snapshot.as_ref().map(|s| s.focused_id) {
+                            let is_mouse_event = matches!(&event, Event::Mouse(_));
+                            if !key_release {
+                                if !is_mouse_event
+                                    && let Some(id) = self.snapshot.as_ref().map(|s| s.focused_id)
+                                {
                                     self.snap_to_bottom(id);
                                 }
                                 self.forward_event(event)?;
