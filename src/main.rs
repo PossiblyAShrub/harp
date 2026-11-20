@@ -2,7 +2,8 @@ use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
 use ratatui::{
@@ -13,7 +14,9 @@ use ratatui::{
 };
 use tui_term::vt100;
 
+mod clipboard;
 mod config;
+mod copymode;
 mod crypto;
 mod picker;
 mod projections;
@@ -23,6 +26,7 @@ mod server;
 mod switcher;
 mod view;
 
+use copymode::{CopyAction, CopyMode};
 use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus};
@@ -44,6 +48,7 @@ struct App {
     picker: Option<ScopePicker>,
     switcher: Option<ScopeSwitcher>,
     rename: Option<RenameModal>,
+    copy_mode: Option<CopyMode>,
     exit: bool,
 }
 
@@ -69,6 +74,7 @@ impl App {
             picker: None,
             switcher: None,
             rename: None,
+            copy_mode: None,
             exit: false,
         };
 
@@ -141,6 +147,7 @@ impl App {
             ServerMsg::ScopeClosed => {
                 self.snapshot = None;
                 self.status.set_scope_name(None);
+                self.copy_mode = None;
                 self.parsers.clear();
                 self.client.send(&ClientMsg::ListScopes)?;
                 match self.client.recv::<ServerMsg>()? {
@@ -200,6 +207,105 @@ impl App {
         Ok(())
     }
 
+    /// True when a key event is the `Ctrl+Shift+C` copy-mode shortcut.
+    fn is_copy_shortcut(key_event: &KeyEvent) -> bool {
+        key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && key_event.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    }
+
+    /// True when a key event is the `Ctrl+Shift+V` paste shortcut.
+    fn is_paste_shortcut(key_event: &KeyEvent) -> bool {
+        key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && key_event.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key_event.code, KeyCode::Char('v') | KeyCode::Char('V'))
+    }
+
+    /// Enters copy mode over the currently focused projection, if any.
+    fn enter_copy_mode(&mut self) {
+        if self.copy_mode.is_some() {
+            return;
+        }
+        let Some(snap) = &self.snapshot else {
+            return;
+        };
+        let Some(parser) = self.parsers.get(&snap.focused_id) else {
+            return;
+        };
+        if let Some(mode) = CopyMode::new(snap.focused_id, parser) {
+            self.copy_mode = Some(mode);
+        }
+    }
+
+    /// Pastes the OS clipboard into the focused projection.
+    ///
+    /// Reading the clipboard keeps the paste entirely inside harp, so the
+    /// terminal emulator's "sanitize or not" confirmation dialog never shows
+    /// up. The text is sanitized before being injected, mirroring kitty's
+    /// sanitize paste action.
+    fn paste_from_clipboard(&mut self) -> io::Result<()> {
+        let Some(text) = clipboard::clipboard_get().map(|t| clipboard::sanitize_for_paste(&t))
+        else {
+            return Ok(());
+        };
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(snap) = &self.snapshot else {
+            return Ok(());
+        };
+        self.client.send(&ClientMsg::Input {
+            scope_id: snap.scope_id,
+            event: Event::Paste(text),
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)
+    }
+
+    /// Event handling while copy mode is active. Copy mode owns all input
+    /// until the user copies, quits, or jumps back to managing mode.
+    fn handle_copy_mode_event(&mut self, event: &Event) -> io::Result<()> {
+        if let Event::Resize(cols, rows) = event {
+            self.workspace_area = Rect::new(0, 0, (*cols).max(1), rows.saturating_sub(1).max(1));
+            return Ok(());
+        }
+
+        let mut leave = CopyLeave::Stay;
+        let mut copied: Option<String> = None;
+
+        if let Some(mode) = &mut self.copy_mode
+            && let Event::Key(key) = event
+            && key.kind != KeyEventKind::Release
+        {
+            if key.code == KeyCode::Char(' ')
+                && key.kind == KeyEventKind::Press
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                leave = CopyLeave::Manage;
+            } else {
+                match mode.handle_key(*key) {
+                    CopyAction::None => {}
+                    CopyAction::Exit => leave = CopyLeave::Exit,
+                    CopyAction::CopyAndExit => copied = Some(mode.copy_text()),
+                }
+            }
+        }
+
+        if let Some(text) = copied {
+            clipboard::clipboard_set(&text);
+        }
+
+        match leave {
+            CopyLeave::Stay => {}
+            CopyLeave::Exit => self.copy_mode = None,
+            CopyLeave::Manage => {
+                self.copy_mode = None;
+                self.set_mode(Mode::Managing);
+            }
+        }
+        Ok(())
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
             terminal.draw(|frame| self.render(frame))?;
@@ -229,7 +335,9 @@ impl App {
         loop {
             let event = event::read()?;
 
-            if let Event::Resize(cols, rows) = event {
+            if self.copy_mode.is_some() {
+                self.handle_copy_mode_event(&event)?;
+            } else if let Event::Resize(cols, rows) = event {
                 self.workspace_area = Rect::new(0, 0, cols.max(1), rows.saturating_sub(1).max(1));
                 if let Some(snap) = &self.snapshot {
                     self.client.send(&ClientMsg::Resize {
@@ -345,6 +453,18 @@ impl App {
                         {
                             self.set_mode(Mode::Managing);
                         }
+                        Event::Key(key_event)
+                            if key_event.kind == KeyEventKind::Press
+                                && Self::is_paste_shortcut(key_event) =>
+                        {
+                            self.paste_from_clipboard()?;
+                        }
+                        Event::Key(key_event)
+                            if key_event.kind == KeyEventKind::Press
+                                && Self::is_copy_shortcut(key_event) =>
+                        {
+                            self.enter_copy_mode();
+                        }
                         _ => {
                             let ignore = matches!(
                                 &event,
@@ -368,7 +488,15 @@ impl App {
                             ) =>
                         {
                             self.status.set_error(None);
-                            if key_event.code == KeyCode::Enter
+                            if key_event.kind == KeyEventKind::Press
+                                && Self::is_copy_shortcut(key_event)
+                            {
+                                self.enter_copy_mode();
+                            } else if key_event.kind == KeyEventKind::Press
+                                && Self::is_paste_shortcut(key_event)
+                            {
+                                self.paste_from_clipboard()?;
+                            } else if key_event.code == KeyCode::Enter
                                 && !key_event
                                     .modifiers
                                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -487,6 +615,10 @@ impl Widget for &App {
         }
         self.status.render(chunks[1], buf);
 
+        if let Some(copy_mode) = &self.copy_mode {
+            copy_mode.render(chunks[0], buf);
+        }
+
         if let Some(picker) = &self.picker {
             picker.render(area, buf);
         }
@@ -497,6 +629,13 @@ impl Widget for &App {
             rename.render(area, buf);
         }
     }
+}
+
+/// How copy mode should end after handling an event.
+enum CopyLeave {
+    Stay,
+    Exit,
+    Manage,
 }
 
 fn arrow_direction(code: KeyCode) -> Option<NavDirection> {

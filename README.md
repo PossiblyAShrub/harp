@@ -65,6 +65,38 @@ your client while a scope continues in the background.
 Projections are individual applications that live in a scope. They may be a
 terminal, an editor, or a custom tool that belongs to a workspace.
 
+### Copy & Paste
+
+Harp has its own clipboard keybindings so it works uniformly across scopes and
+remote sessions, and so pasting never triggers the terminal emulator's
+"sanitize or not" confirmation dialog:
+
+- `Ctrl+Shift+C` — enter copy mode over the focused pane. `Space` anchors a
+  selection, arrows/extended keys move and extend it, and `Enter` or
+  `Ctrl+Shift+C` copies the selection (or the whole visible screen if nothing
+  is selected) to the OS clipboard. `q`/`Esc` quits without copying,
+  `Ctrl+Space` jumps back to managing mode.
+- `Ctrl+Shift+V` — paste the OS clipboard into the focused terminal. Content
+  is sanitized (escape sequences and control codes are stripped, mirroring
+  kitty's "sanitize" paste action) before being injected via bracketed paste.
+
+**kitty requirement.** By default kitty handles `Ctrl+Shift+C` (copy selection)
+and `Ctrl+Shift+V` (paste) itself and never sends them to harp. To let harp see
+them, unbind them in `~/.config/kitty/kitty.conf`:
+
+```text
+map ctrl+shift+c no_op
+map ctrl+shift+v no_op
+```
+
+**Clipboard access.** Copying prefers the terminal emulator's OSC 52
+(write-clipboard) support, which kitty allows by default; if you also want
+copies to land on the clipboard when harp runs in a terminal without OSC 52
+support, install `wl-copy`/`wl-paste` (Wayland), `xclip` or `xsel` (X11),
+`pbcopy`/`pbpaste` (macOS) or the `termux-clipboard-*` tools (Android). Pasting
+reads the clipboard through those tools (OSC 52 *reads* would themselves show a
+confirmation prompt in kitty, so they are not used).
+
 ### `.harp` Configuration
 
 Launcher programs are discovered from `.harp` files in the following order

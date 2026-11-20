@@ -93,7 +93,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Green)
                         .add_modifier(Modifier::BOLD),
-                    " Ctrl+Space: manage",
+                    " Ctrl+Space: manage | Ctrl+Shift+C: copy | Ctrl+Shift+V: paste",
                 ),
                 Mode::Managing => (
                     " MANAGING ",
