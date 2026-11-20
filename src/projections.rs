@@ -328,11 +328,11 @@ impl ProjectionTerm {
 
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> io::Result<()> {
         let application_cursor = self.parser.lock().unwrap().screen().application_cursor();
-        if let Some(bytes) = encode_key_event(key_event, application_cursor) {
-            if let Some(writer) = self.writer.lock().unwrap().as_mut() {
-                writer.write_all(&bytes)?;
-                writer.flush()?;
-            }
+        if let Some(bytes) = encode_key_event(key_event, application_cursor)
+            && let Some(writer) = self.writer.lock().unwrap().as_mut()
+        {
+            writer.write_all(&bytes)?;
+            writer.flush()?;
         }
 
         Ok(())

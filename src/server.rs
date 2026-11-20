@@ -523,18 +523,15 @@ pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
 
     let addr = format!("127.0.0.1:{local_port}");
     for _ in 0..100 {
-        if let Ok(stream) = TcpStream::connect(&addr) {
-            match EncryptedStream::handshake_client(stream) {
-                Ok(stream) => {
-                    return Ok(ClientConnection {
-                        stream,
-                        _tunnel: Some(tunnel),
-                        pending: VecDeque::new(),
-                        trace: VecDeque::new(),
-                    });
-                }
-                Err(_) => {}
-            }
+        if let Ok(stream) = TcpStream::connect(&addr)
+            && let Ok(stream) = EncryptedStream::handshake_client(stream)
+        {
+            return Ok(ClientConnection {
+                stream,
+                _tunnel: Some(tunnel),
+                pending: VecDeque::new(),
+                trace: VecDeque::new(),
+            });
         }
         if let Some(status) = tunnel.try_wait()? {
             anyhow::bail!("SSH tunnel exited before connecting ({status})");
