@@ -1,4 +1,5 @@
 use std::{
+    hash::{Hash, Hasher},
     io::{self, Read, Write},
     path::Path,
     sync::{
@@ -31,6 +32,9 @@ pub enum Mode {
     Interacting,
     Managing,
 }
+
+/// Maximum number of scrolled-off rows kept per terminal projection.
+pub const SCROLLBACK_LINES: usize = 1000;
 
 pub struct ProjectionStatus {
     mode: Mode,
@@ -135,6 +139,9 @@ pub struct ProjectionTerm {
     notify: Arc<(Mutex<u64>, Condvar)>,
     size: (u16, u16),
     program: String,
+    /// Hash of the scrollback serialization from the last snapshot, used to
+    /// avoid re-sending unchanged history on every poll.
+    last_scrollback_hash: AtomicU64,
 }
 
 impl ProjectionTerm {
@@ -162,7 +169,7 @@ impl ProjectionTerm {
         cmd.cwd(cwd);
         let mut child = pty.slave.spawn_command(cmd)?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 1000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let exited = Arc::new(AtomicBool::new(false));
         let revision = Arc::new(AtomicU64::new(1));
         let notify = Arc::new((Mutex::new(0u64), Condvar::new()));
@@ -208,6 +215,7 @@ impl ProjectionTerm {
             notify,
             size: (cols, rows),
             program: program.to_string(),
+            last_scrollback_hash: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -227,10 +235,28 @@ impl ProjectionTerm {
         self.revision.load(Ordering::Acquire)
     }
 
-    pub fn state_snapshot(&self) -> (u16, u16, Vec<u8>) {
-        let parser = self.parser.lock().unwrap();
+    pub fn state_snapshot(&self) -> (u16, u16, Vec<u8>, Vec<u8>) {
+        let mut parser = self.parser.lock().unwrap();
         let (rows, cols) = parser.screen().size();
-        (cols, rows, parser.screen().state_formatted())
+        let state = parser.screen().state_formatted();
+
+        // Scrollback only exists for the main screen; while an application is
+        // on the alternate screen (vim, less, ...) there is nothing to scroll
+        // and the history must not be repainted underneath it.
+        let scrollback = if parser.screen().alternate_screen() {
+            Vec::new()
+        } else {
+            let history = serialize_history(&mut parser);
+            let hash = hash_bytes(&history);
+            if hash == self.last_scrollback_hash.load(Ordering::Acquire) {
+                Vec::new()
+            } else {
+                self.last_scrollback_hash.store(hash, Ordering::Release);
+                pad_scrollback(history, rows)
+            }
+        };
+
+        (cols, rows, state, scrollback)
     }
 
     pub fn handle_event(&mut self, event: &Event) -> io::Result<()> {
@@ -316,6 +342,57 @@ impl ProjectionTerm {
 
         Ok(())
     }
+}
+
+/// Serializes every scrolled-out row of the pane's main screen as plain text
+/// (one line per grid row, `\r\n` separated) so the client can rebuild the
+/// same history in its own parser. The currently visible rows are not
+/// included; they arrive via `state_formatted`.
+///
+/// Scrollback offset 0 shows the bottom of the screen; `total` is the number
+/// of scrolled-out rows. The walk starts at the top (offset `total`) and works
+/// down, taking only the history portion of each window.
+fn serialize_history(parser: &mut vt100::Parser) -> Vec<u8> {
+    let screen = parser.screen_mut();
+    screen.set_scrollback(usize::MAX);
+    let total = screen.scrollback();
+    screen.set_scrollback(0);
+    let (rows, cols) = screen.size();
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < total {
+        screen.set_scrollback(total - start);
+        let take = (total - start).min(usize::from(rows));
+        for line in screen.rows(0, cols).take(take) {
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        start += take;
+    }
+    screen.set_scrollback(0);
+    out
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Appends enough blank lines that, once a client overwrites the visible area
+/// with the `state` bytes, the whole history has scrolled into the client
+/// parser's scrollback.
+///
+/// Feeding `L` single-row lines into a `rows`-row grid leaves exactly
+/// `max(0, L - rows + 1)` rows of scrollback (the trailing `\r\n` of the last
+/// line leaves a blank bottom row), so padding the `total` history lines with
+/// `rows - 1` blanks makes the client's scrollback hold exactly `total` rows.
+fn pad_scrollback(mut history: Vec<u8>, rows: u16) -> Vec<u8> {
+    for _ in 0..usize::from(rows.saturating_sub(1)) {
+        history.extend_from_slice(b"\r\n");
+    }
+    history
 }
 
 fn xterm_modifier(modifiers: KeyModifiers) -> Option<u8> {
@@ -811,5 +888,53 @@ mod tests {
             ),
             Some(vec![0x1b, b'[', b'M', 35, 42, 37])
         );
+    }
+
+    #[test]
+    fn scrollback_serialization_rebuilds_history_in_a_fresh_parser() {
+        let mut server = vt100::Parser::new(4, 20, SCROLLBACK_LINES);
+        for i in 0..20 {
+            server.process(format!("line {i:02}\r\n").as_bytes());
+        }
+        let (rows, _) = server.screen().size();
+        let history = serialize_history(&mut server);
+        let state = server.screen().state_formatted();
+        let payload = pad_scrollback(history, rows);
+
+        // Simulate the client: rebuild a fresh parser from the payload, then
+        // apply the visible state on top.
+        let mut client = vt100::Parser::new(4, 20, SCROLLBACK_LINES);
+        client.process(&payload);
+        client.process(&state);
+
+        // The rebuilt parser must hold exactly as many history rows as the
+        // server's parser does.
+        server.screen_mut().set_scrollback(usize::MAX);
+        let total = server.screen().scrollback();
+        server.screen_mut().set_scrollback(0);
+        client.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(client.screen().scrollback(), total);
+        client.screen_mut().set_scrollback(0);
+
+        // The visible bottom matches the server's current screen.
+        assert_eq!(client.screen().contents(), server.screen().contents());
+
+        // Scrolling both to the top shows the same oldest content.
+        client.screen_mut().set_scrollback(usize::MAX);
+        server.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(client.screen().contents(), server.screen().contents());
+        assert!(client.screen().contents().starts_with("line 00\nline 01"));
+    }
+
+    #[test]
+    fn scrollback_snapshot_skips_resending_unchanged_history() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new("/").to_path_buf());
+        let term = ProjectionTerm::with_command(20, 4, "true", &cwd).unwrap();
+        let (_, _, _, first) = term.state_snapshot();
+        let (_, _, _, second) = term.state_snapshot();
+        // "true" writes nothing, but the first snapshot still pads the
+        // (empty) history; the second must report no change.
+        assert!(!first.is_empty());
+        assert!(second.is_empty());
     }
 }

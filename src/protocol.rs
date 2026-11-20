@@ -45,6 +45,9 @@ pub struct TabPageSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub state: Vec<u8>,
+    /// Serialized scrollback history. Empty when it hasn't changed since the
+    /// previous snapshot (or when the pane is on the alternate screen).
+    pub scrollback: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +63,7 @@ pub enum SnapshotNode {
         cols: u16,
         rows: u16,
         state: Vec<u8>,
+        scrollback: Vec<u8>,
     },
     Split {
         direction: SplitDir,

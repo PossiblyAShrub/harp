@@ -3,7 +3,7 @@ use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use ratatui::{
@@ -29,13 +29,13 @@ mod view;
 use copymode::{CopyAction, CopyMode};
 use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
-use projections::{Mode, ProjectionStatus};
+use projections::{Mode, ProjectionStatus, SCROLLBACK_LINES};
 use protocol::{
     ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir,
 };
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
-use view::SnapshotView;
+use view::{SnapshotView, pane_at};
 
 struct App {
     client: EncryptedStream,
@@ -49,6 +49,8 @@ struct App {
     switcher: Option<ScopeSwitcher>,
     rename: Option<RenameModal>,
     copy_mode: Option<CopyMode>,
+    /// Per-projection scrollback view offset (rows above the bottom).
+    scroll: HashMap<usize, usize>,
     exit: bool,
 }
 
@@ -75,6 +77,7 @@ impl App {
             switcher: None,
             rename: None,
             copy_mode: None,
+            scroll: HashMap::new(),
             exit: false,
         };
 
@@ -104,8 +107,19 @@ impl App {
         let mut active_ids = Vec::new();
         self.sync_parsers(&snap.root, &mut active_ids);
         self.parsers.retain(|id, _| active_ids.contains(id));
+        self.scroll.retain(|id, _| active_ids.contains(id));
         self.status.set_scope_name(Some(snap.scope_name.clone()));
         self.snapshot = Some(snap);
+
+        // Re-apply each projection's saved scroll position onto its parser.
+        // Parsers keep their scrollback offset across polls, so this only
+        // matters after a rebuild or a fresh parser.
+        for (id, offset) in &self.scroll {
+            if let Some(parser) = self.parsers.get_mut(id) {
+                let total = total_scrollback(parser);
+                parser.screen_mut().set_scrollback((*offset).min(total));
+            }
+        }
     }
 
     fn sync_parsers(&mut self, node: &SnapshotNode, active_ids: &mut Vec<usize>) {
@@ -115,11 +129,10 @@ impl App {
                 cols,
                 rows,
                 state,
+                scrollback,
             } => {
                 active_ids.push(*id);
-                let mut parser = vt100::Parser::new((*rows).max(1), (*cols).max(1), 0);
-                parser.process(state);
-                self.parsers.insert(*id, parser);
+                self.upsert_parser(*id, *cols, *rows, state, scrollback);
             }
             SnapshotNode::Split { children, .. } => {
                 for child in children {
@@ -129,10 +142,45 @@ impl App {
             SnapshotNode::Tabs { pages, .. } => {
                 for page in pages {
                     active_ids.push(page.id);
-                    let mut parser = vt100::Parser::new(page.rows.max(1), page.cols.max(1), 0);
-                    parser.process(&page.state);
-                    self.parsers.insert(page.id, parser);
+                    self.upsert_parser(
+                        page.id,
+                        page.cols,
+                        page.rows,
+                        &page.state,
+                        &page.scrollback,
+                    );
                 }
+            }
+        }
+    }
+
+    /// Keeps one persistent parser per projection. A non-empty `scrollback`
+    /// means the server's history changed and the parser must be rebuilt from
+    /// scratch (scrollback can't be appended incrementally). Otherwise the
+    /// existing parser is resized if needed and the visible state applied on
+    /// top, which leaves its scrollback untouched.
+    fn upsert_parser(&mut self, id: usize, cols: u16, rows: u16, state: &[u8], scrollback: &[u8]) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        if !scrollback.is_empty() {
+            let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            parser.process(scrollback);
+            parser.process(state);
+            self.parsers.insert(id, parser);
+            return;
+        }
+        match self.parsers.get_mut(&id) {
+            Some(parser) => {
+                let (prows, pcols) = parser.screen().size();
+                if (prows, pcols) != (rows, cols) {
+                    parser.screen_mut().set_size(rows, cols);
+                }
+                parser.process(state);
+            }
+            None => {
+                let mut parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+                parser.process(state);
+                self.parsers.insert(id, parser);
             }
         }
     }
@@ -149,6 +197,7 @@ impl App {
                 self.status.set_scope_name(None);
                 self.copy_mode = None;
                 self.parsers.clear();
+                self.scroll.clear();
                 self.client.send(&ClientMsg::ListScopes)?;
                 match self.client.recv::<ServerMsg>()? {
                     ServerMsg::Scopes(scopes) if !scopes.is_empty() => {
@@ -257,6 +306,88 @@ impl App {
         self.client.send(&ClientMsg::Input {
             scope_id: snap.scope_id,
             event: Event::Paste(text),
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)
+    }
+
+    /// True when a projection is on its alternate screen (vim, less, ...),
+    /// where there is no scrollback and scrolling is left to the program.
+    fn pane_in_alternate_screen(&self, id: usize) -> bool {
+        self.parsers
+            .get(&id)
+            .is_some_and(|p| p.screen().alternate_screen())
+    }
+
+    /// Scrolls `id`'s view by `delta` rows. Offset 0 is the bottom of the
+    /// screen; positive `delta` scrolls up into history, negative toward it.
+    fn scroll_pane(&mut self, id: usize, delta: i64) {
+        let Some(parser) = self.parsers.get_mut(&id) else {
+            return;
+        };
+        let total = total_scrollback(parser);
+        let offset = i64::try_from(*self.scroll.get(&id).unwrap_or(&0))
+            .unwrap_or_default()
+            .saturating_add(delta)
+            .clamp(0, i64::try_from(total).unwrap_or_default()) as usize;
+        self.scroll.insert(id, offset);
+        parser.screen_mut().set_scrollback(offset);
+    }
+
+    /// Scrolls `id`'s view by one page worth of rows.
+    fn scroll_pane_page(&mut self, id: usize, dir: i64) {
+        let page = self
+            .parsers
+            .get(&id)
+            .map(|p| {
+                let (rows, _) = p.screen().size();
+                usize::from(rows.saturating_sub(2).max(1))
+            })
+            .unwrap_or(24);
+        self.scroll_pane(id, dir * i64::try_from(page).unwrap_or(24));
+    }
+
+    /// Resets `id`'s view to the bottom of the scrollback.
+    fn snap_to_bottom(&mut self, id: usize) {
+        self.scroll.insert(id, 0);
+        if let Some(parser) = self.parsers.get_mut(&id) {
+            parser.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Routes a mouse wheel event: scroll the pane under the pointer when it
+    /// has a main-screen scrollback, otherwise forward the event to the
+    /// program running in it.
+    fn handle_wheel(&mut self, mouse: MouseEvent) -> io::Result<()> {
+        let target = self
+            .snapshot
+            .as_ref()
+            .and_then(|snap| pane_at(&snap.root, self.workspace_area, mouse.column, mouse.row));
+        let Some(id) = target else {
+            return Ok(());
+        };
+        if self.pane_in_alternate_screen(id) {
+            return self.forward_event(Event::Mouse(mouse));
+        }
+        // offset 0 is the bottom; increasing it moves the view into history.
+        let delta = if mouse.kind == MouseEventKind::ScrollUp {
+            3
+        } else {
+            -3
+        };
+        self.scroll_pane(id, delta);
+        Ok(())
+    }
+
+    /// Sends an event to the server for the focused scope, applying any
+    /// returned snapshot.
+    fn forward_event(&mut self, event: Event) -> io::Result<()> {
+        let Some(snap) = &self.snapshot else {
+            return Ok(());
+        };
+        self.client.send(&ClientMsg::Input {
+            scope_id: snap.scope_id,
+            event,
         })?;
         let reply = self.client.recv::<ServerMsg>()?;
         self.handle_server_reply(reply)
@@ -465,18 +596,46 @@ impl App {
                         {
                             self.enter_copy_mode();
                         }
+                        Event::Mouse(mouse_event)
+                            if matches!(
+                                mouse_event.kind,
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            ) =>
+                        {
+                            self.handle_wheel(*mouse_event)?;
+                        }
+                        Event::Key(key_event)
+                            if key_event.kind == KeyEventKind::Press
+                                && matches!(
+                                    key_event.code,
+                                    KeyCode::PageUp | KeyCode::PageDown
+                                )
+                                && key_event.modifiers == KeyModifiers::NONE =>
+                        {
+                            let focused = self.snapshot.as_ref().map(|s| s.focused_id);
+                            if let Some(id) = focused
+                                && !self.pane_in_alternate_screen(id)
+                            {
+                                let dir = if key_event.code == KeyCode::PageUp {
+                                    1
+                                } else {
+                                    -1
+                                };
+                                self.scroll_pane_page(id, dir);
+                            } else {
+                                self.forward_event(event)?;
+                            }
+                        }
                         _ => {
                             let ignore = matches!(
                                 &event,
                                 Event::Key(k) if k.kind == KeyEventKind::Release
                             );
-                            if !ignore && let Some(snap) = &self.snapshot {
-                                self.client.send(&ClientMsg::Input {
-                                    scope_id: snap.scope_id,
-                                    event,
-                                })?;
-                                let reply = self.client.recv::<ServerMsg>()?;
-                                self.handle_server_reply(reply)?;
+                            if !ignore {
+                                if let Some(id) = self.snapshot.as_ref().map(|s| s.focused_id) {
+                                    self.snap_to_bottom(id);
+                                }
+                                self.forward_event(event)?;
                             }
                         }
                     },
@@ -496,6 +655,20 @@ impl App {
                                 && Self::is_paste_shortcut(key_event)
                             {
                                 self.paste_from_clipboard()?;
+                            } else if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
+                                && key_event.modifiers == KeyModifiers::NONE
+                            {
+                                let focused = self.snapshot.as_ref().map(|s| s.focused_id);
+                                if let Some(id) = focused
+                                    && !self.pane_in_alternate_screen(id)
+                                {
+                                    let dir = if key_event.code == KeyCode::PageUp {
+                                        1
+                                    } else {
+                                        -1
+                                    };
+                                    self.scroll_pane_page(id, dir);
+                                }
                             } else if key_event.code == KeyCode::Enter
                                 && !key_event
                                     .modifiers
@@ -578,14 +751,14 @@ impl App {
                                 }
                             }
                         }
-                        Event::Mouse(_) => {
-                            if let Some(snap) = &self.snapshot {
-                                self.client.send(&ClientMsg::Input {
-                                    scope_id: snap.scope_id,
-                                    event,
-                                })?;
-                                let reply = self.client.recv::<ServerMsg>()?;
-                                self.handle_server_reply(reply)?;
+                        Event::Mouse(mouse_event) => {
+                            if matches!(
+                                mouse_event.kind,
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            ) {
+                                self.handle_wheel(*mouse_event)?;
+                            } else {
+                                self.forward_event(event)?;
                             }
                         }
                         _ => {}
@@ -636,6 +809,14 @@ enum CopyLeave {
     Stay,
     Exit,
     Manage,
+}
+
+/// Number of scrolled-out rows currently available in a parser's scrollback.
+fn total_scrollback(parser: &mut vt100::Parser) -> usize {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    let total = parser.screen().scrollback();
+    parser.screen_mut().set_scrollback(0);
+    total
 }
 
 fn arrow_direction(code: KeyCode) -> Option<NavDirection> {
