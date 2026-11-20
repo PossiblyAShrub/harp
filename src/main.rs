@@ -189,9 +189,17 @@ impl App {
         match reply {
             ServerMsg::Snapshot(snap) => {
                 self.status.set_error(None);
+                // Forward escape sequences the server couldn't render (kitty
+                // graphics protocol) to the real terminal for display.
+                if !snap.passthrough.is_empty() {
+                    let mut stdout = io::stdout().lock();
+                    let _ = stdout.write_all(&snap.passthrough);
+                    let _ = stdout.flush();
+                }
                 self.apply_snapshot(snap);
             }
             ServerMsg::Unchanged => {}
+            ServerMsg::Ok => {}
             ServerMsg::ScopeClosed => {
                 self.snapshot = None;
                 self.status.set_scope_name(None);
@@ -819,6 +827,85 @@ fn total_scrollback(parser: &mut vt100::Parser) -> usize {
     total
 }
 
+/// Queries the real terminal for its character cell size in pixels via
+/// `CSI 16 t` (supported by kitty, wezterm, xterm, ...). Returns `None` when
+/// the terminal doesn't answer.
+fn query_pixel_sizes() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        // The response arrives on the terminal's input; read it from the
+        // controlling tty directly so crossterm's own event reader (which
+        // starts later) never sees these bytes.
+        let mut tty = std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/tty")
+            .ok()?;
+        // The fd is a fresh open of /dev/tty, so the nonblocking flag only
+        // affects this handle and disappears when it's dropped.
+        unsafe {
+            libc::fcntl(tty.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+
+        let _ = crossterm::terminal::enable_raw_mode();
+        let result = (|| {
+            let mut stdout = io::stdout();
+            stdout.write_all(b"\x1b[16t").ok()?;
+            stdout.flush().ok()?;
+
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 128];
+            let start = Instant::now();
+            loop {
+                if let Some((h, w)) = parse_pixel_response(&buf, b'6') {
+                    return Some((w, h));
+                }
+                if start.elapsed() > Duration::from_millis(300) {
+                    return None;
+                }
+                match tty.read(&mut chunk) {
+                    Ok(0) => return None,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return None,
+                }
+            }
+        })();
+        let _ = crossterm::terminal::disable_raw_mode();
+        result
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// Finds a `ESC [ <kind> ; <height> ; <width> t` response in `buf`.
+fn parse_pixel_response(buf: &[u8], kind: u8) -> Option<(u16, u16)> {
+    let mut i = 0;
+    while i + 4 <= buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == kind && buf[i + 3] == b';' {
+            let rest = &buf[i + 4..];
+            let mut parts = rest.split(|&b| b == b';' || b == b't');
+            let height = parse_num(parts.next()?)?;
+            let width = parse_num(parts.next()?)?;
+            return Some((height, width));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_num(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
 fn arrow_direction(code: KeyCode) -> Option<NavDirection> {
     match code {
         KeyCode::Up => Some(NavDirection::Up),
@@ -862,7 +949,16 @@ fn main() -> Result<()> {
         return server::run_server(&addr);
     }
 
-    let client = server::connect_or_spawn(&addr)?;
+    let mut client = server::connect_or_spawn(&addr)?;
+
+    // Report the real terminal's cell size in pixels so the server can put it
+    // in the PTY's TIOCGWINSZ and answer size queries. Without it programs
+    // like `kitty +kitten icat` think the terminal can't report pixel sizes.
+    if let Some((cell_w, cell_h)) = query_pixel_sizes() {
+        let _ = client.send(&ClientMsg::SetPixelSize { cell_w, cell_h });
+        let _ = client.recv::<ServerMsg>();
+    }
+
     ratatui::run(|terminal| {
         // Without these sequences the terminal never reports mouse events, so
         // nothing could be forwarded to projections. The guard restores mouse
@@ -887,5 +983,24 @@ impl Drop for MouseCaptureGuard {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cell_size_response() {
+        // CSI 16 t replies with ESC [ 6 ; <height> ; <width> t.
+        assert_eq!(parse_pixel_response(b"\x1b[6;23;10t", b'6'), Some((23, 10)));
+        // Extra bytes before the response are tolerated.
+        assert_eq!(
+            parse_pixel_response(b"\x1b[?2004l\x1b[6;24;12t", b'6'),
+            Some((24, 12))
+        );
+        // Partial / malformed responses are ignored.
+        assert_eq!(parse_pixel_response(b"\x1b[6;23", b'6'), None);
+        assert_eq!(parse_pixel_response(b"nothing here", b'6'), None);
     }
 }

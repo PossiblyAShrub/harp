@@ -32,6 +32,8 @@ struct ServerState {
     scopes: Vec<ServerScope>,
     next_id: u64,
     had_scopes: bool,
+    /// Character cell size in pixels reported by the client's terminal.
+    cell_px: (u16, u16),
 }
 
 impl ServerState {
@@ -40,6 +42,7 @@ impl ServerState {
             scopes: Vec::new(),
             next_id: 1,
             had_scopes: false,
+            cell_px: (0, 0),
         }
     }
 
@@ -62,6 +65,13 @@ impl ServerState {
         self.prune_all();
 
         match msg {
+            ClientMsg::SetPixelSize { cell_w, cell_h } => {
+                self.cell_px = (cell_w, cell_h);
+                for s in &mut self.scopes {
+                    let _ = s.scope.set_cell_pixels(cell_w, cell_h);
+                }
+                ServerMsg::Ok
+            }
             ClientMsg::ListScopes => {
                 let infos = self
                     .scopes
@@ -78,8 +88,8 @@ impl ServerState {
             ClientMsg::CreateScope { cwd, cols, rows } => {
                 let id = self.next_id;
                 let area = Rect::new(0, 0, cols.max(1), rows.max(1));
-                match Scope::with_terminals_in(1, Direction::Horizontal, area, &cwd) {
-                    Ok(scope) => {
+                match Scope::with_terminals_in(1, Direction::Horizontal, area, &cwd, self.cell_px) {
+                    Ok(mut scope) => {
                         self.next_id += 1;
                         let name = cwd
                             .file_name()

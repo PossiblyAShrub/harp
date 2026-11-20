@@ -68,6 +68,18 @@ impl Projection {
         matches!(self, Projection::Term(_))
     }
 
+    fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
+        match self {
+            Projection::Term(term) => term.set_cell_size(w, h),
+        }
+    }
+
+    fn take_passthrough(&mut self) -> Vec<u8> {
+        match self {
+            Projection::Term(term) => term.take_passthrough(),
+        }
+    }
+
     fn resize(&mut self, rect: Rect) -> io::Result<()> {
         match self {
             Projection::Term(term) => {
@@ -180,6 +192,40 @@ impl TileNode {
                 children.iter().find_map(|c| c.node.first_leaf_id())
             }
             TileNode::Tabs { pages, .. } => pages.first().map(|p| p.id),
+        }
+    }
+
+    fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
+        match self {
+            TileNode::Leaf { projection, .. } => projection.set_cell_pixels(w, h),
+            TileNode::Split { children, .. } => {
+                for child in children.iter_mut() {
+                    child.node.set_cell_pixels(w, h)?;
+                }
+                Ok(())
+            }
+            TileNode::Tabs { pages, .. } => {
+                for page in pages.iter_mut() {
+                    page.projection.set_cell_pixels(w, h)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn drain_passthrough(&mut self) -> Vec<u8> {
+        match self {
+            TileNode::Leaf { projection, .. } => projection.take_passthrough(),
+            TileNode::Split { children, .. } => {
+                children.iter_mut().fold(Vec::new(), |mut acc, c| {
+                    acc.extend(c.node.drain_passthrough());
+                    acc
+                })
+            }
+            TileNode::Tabs { pages, .. } => pages.iter_mut().fold(Vec::new(), |mut acc, p| {
+                acc.extend(p.projection.take_passthrough());
+                acc
+            }),
         }
     }
 
@@ -586,6 +632,7 @@ pub struct Scope {
     next_id: usize,
     area: Rect,
     layout_revision: u64,
+    cell_px: (u16, u16),
 }
 
 impl Scope {
@@ -625,6 +672,7 @@ impl Scope {
             next_id,
             area,
             layout_revision: 1,
+            cell_px: (0, 0),
         };
         scope.resize(area)?;
         Ok(scope)
@@ -635,24 +683,21 @@ impl Scope {
         direction: Direction,
         area: Rect,
         cwd: &Path,
+        cell_px: (u16, u16),
     ) -> Result<Self> {
         let constraints = vec![Constraint::Fill(1); count];
         let rects = Layout::new(direction, constraints).split(area);
         let mut children = Vec::with_capacity(count);
         for rect in rects.iter() {
             let inner = pane_inner(*rect);
-            children.push((
-                Constraint::Fill(1),
-                Projection::Term(ProjectionTerm::with_command(
-                    inner.width,
-                    inner.height,
-                    "zsh",
-                    cwd,
-                )?),
-            ));
+            let mut term = ProjectionTerm::with_command(inner.width, inner.height, "zsh", cwd)?;
+            term.set_cell_size(cell_px.0, cell_px.1)?;
+            children.push((Constraint::Fill(1), Projection::Term(term)));
         }
 
-        Ok(Self::from_children(direction, children, area)?)
+        let mut scope = Self::from_children(direction, children, area)?;
+        scope.cell_px = cell_px;
+        Ok(scope)
     }
 
     pub fn revision(&self) -> u64 {
@@ -668,7 +713,11 @@ impl Scope {
         self.root.as_ref().map_or(0, TileNode::leaf_count)
     }
 
-    pub fn snapshot(&self, scope_id: u64, scope_name: String) -> Option<ScopeSnapshot> {
+    pub fn snapshot(&mut self, scope_id: u64, scope_name: String) -> Option<ScopeSnapshot> {
+        let passthrough = self
+            .root
+            .as_mut()
+            .map_or(Vec::new(), TileNode::drain_passthrough);
         let root = self.root.as_ref()?.to_snapshot()?;
         Some(ScopeSnapshot {
             scope_id,
@@ -676,7 +725,20 @@ impl Scope {
             revision: self.revision(),
             focused_id: self.focused_id,
             root,
+            passthrough,
         })
+    }
+
+    /// Updates the character cell pixel size used for TIOCGWINSZ reporting.
+    pub fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
+        if self.cell_px == (w, h) {
+            return Ok(());
+        }
+        self.cell_px = (w, h);
+        if let Some(root) = &mut self.root {
+            root.set_cell_pixels(w, h)?;
+        }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -734,8 +796,9 @@ impl Scope {
     pub fn split_focused_with_spec(&mut self, dir: NavDirection, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let term =
+            let mut term =
                 ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
+            term.set_cell_size(self.cell_px.0, self.cell_px.1)?;
             let id = self.next_id;
             self.next_id += 1;
             self.root = Some(TileNode::Leaf {
@@ -749,12 +812,9 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder = Projection::Term(ProjectionTerm::with_command(
-            1,
-            1,
-            &spec.program,
-            &spec.cwd,
-        )?);
+        let mut placeholder = ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?;
+        placeholder.set_cell_size(self.cell_px.0, self.cell_px.1)?;
+        let placeholder = Projection::Term(placeholder);
         if root
             .split_leaf(self.focused_id, dir, new_id, placeholder)
             .is_ok()
@@ -770,8 +830,9 @@ impl Scope {
     pub fn new_tab_with_spec(&mut self, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let term =
+            let mut term =
                 ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
+            term.set_cell_size(self.cell_px.0, self.cell_px.1)?;
             let id = self.next_id;
             self.next_id += 1;
             self.root = Some(TileNode::Leaf {
@@ -781,16 +842,12 @@ impl Scope {
             self.focused_id = id;
             return Ok(());
         };
-
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder = Projection::Term(ProjectionTerm::with_command(
-            1,
-            1,
-            &spec.program,
-            &spec.cwd,
-        )?);
+        let mut placeholder = ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?;
+        placeholder.set_cell_size(self.cell_px.0, self.cell_px.1)?;
+        let placeholder = Projection::Term(placeholder);
         if root.new_tab(self.focused_id, new_id, placeholder).is_ok() {
             self.focused_id = new_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);
@@ -998,9 +1055,14 @@ mod tests {
     #[test]
     fn mouse_press_focuses_pane_under_cursor_but_hover_does_not() {
         let cwd = std::env::temp_dir();
-        let mut scope =
-            Scope::with_terminals_in(2, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
-                .unwrap();
+        let mut scope = Scope::with_terminals_in(
+            2,
+            Direction::Horizontal,
+            Rect::new(0, 0, 80, 24),
+            &cwd,
+            (8, 16),
+        )
+        .unwrap();
         assert_eq!(scope.focused_id, 0);
 
         // Pressing inside the right-hand pane moves focus there.
@@ -1037,9 +1099,14 @@ mod tests {
     #[test]
     fn new_tab_wraps_leaf_and_switch_tab_moves_active() {
         let cwd = std::env::temp_dir();
-        let mut scope =
-            Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
-                .unwrap();
+        let mut scope = Scope::with_terminals_in(
+            1,
+            Direction::Horizontal,
+            Rect::new(0, 0, 80, 24),
+            &cwd,
+            (8, 16),
+        )
+        .unwrap();
         assert_eq!(scope.leaf_count(), 1);
 
         let spec = ScopeSpec::default_zsh(cwd);
@@ -1057,11 +1124,15 @@ mod tests {
     #[test]
     fn new_tab_adds_page_to_existing_tab_group() {
         let cwd = std::env::temp_dir();
-        let mut scope =
-            Scope::with_terminals_in(1, Direction::Horizontal, Rect::new(0, 0, 80, 24), &cwd)
-                .unwrap();
+        let mut scope = Scope::with_terminals_in(
+            1,
+            Direction::Horizontal,
+            Rect::new(0, 0, 80, 24),
+            &cwd,
+            (8, 16),
+        )
+        .unwrap();
         let spec = ScopeSpec::default_zsh(cwd.clone());
-
         scope.new_tab_with_spec(&spec).unwrap();
         assert_eq!(scope.leaf_count(), 2);
         let first_tab_focus = scope.focused_id;

@@ -82,10 +82,19 @@ pub struct ScopeSnapshot {
     pub revision: u64,
     pub focused_id: usize,
     pub root: SnapshotNode,
+    /// Terminal escape sequences (e.g. kitty graphics protocol APC codes) that
+    /// the client must write through to the real terminal for display.
+    pub passthrough: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
+    /// Reports the real terminal's character cell size in pixels so the server
+    /// can report pixel sizes through TIOCGWINSZ and answer size queries.
+    SetPixelSize {
+        cell_w: u16,
+        cell_h: u16,
+    },
     ListScopes,
     CreateScope {
         cwd: PathBuf,
@@ -135,6 +144,7 @@ pub enum ClientMsg {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
+    Ok,
     Scopes(Vec<ScopeInfo>),
     Snapshot(ScopeSnapshot),
     Unchanged,
