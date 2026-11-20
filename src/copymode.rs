@@ -39,6 +39,8 @@ pub struct CopyMode {
     anchor: Option<(u16, u16)>,
     dragging: bool,
     mouse_selection: bool,
+    word_dragging: bool,
+    word_drag_origin: Option<((u16, u16), (u16, u16))>,
 }
 
 impl CopyMode {
@@ -60,29 +62,164 @@ impl CopyMode {
             anchor: None,
             dragging: false,
             mouse_selection: false,
+            word_dragging: false,
+            word_drag_origin: None,
         })
     }
 
     /// Starts a mouse selection at a pane-local cell.
-    pub fn mouse_down(&mut self, col: u16, row: u16) {
+    pub fn mouse_down(&mut self, col: u16, row: u16) -> bool {
+        if !self.cell_has_text(col, row) {
+            return false;
+        }
         self.mouse_selection = true;
-        self.cursor_col = col.min(self.cols.saturating_sub(1));
         self.cursor_row = row.min(self.rows.saturating_sub(1));
+        self.cursor_col = self.lead_col(col.min(self.cols.saturating_sub(1)), self.cursor_row);
         self.anchor = Some((self.cursor_col, self.cursor_row));
         self.dragging = true;
+        self.word_dragging = false;
+        self.word_drag_origin = None;
+        true
+    }
+
+    /// Selects the contiguous word at a pane-local cell.
+    pub fn select_word_at(&mut self, col: u16, row: u16) -> bool {
+        if !self.cell_has_text(col, row) {
+            return false;
+        }
+        let Some((start, end)) = self.word_bounds(col, row) else {
+            return false;
+        };
+        self.mouse_selection = true;
+        self.cursor_col = end;
+        self.cursor_row = row;
+        self.anchor = Some((start, row));
+        self.dragging = true;
+        self.word_dragging = true;
+        self.word_drag_origin = Some(((start, row), (end, row)));
+        true
     }
 
     /// Extends an active mouse selection to a pane-local cell.
     pub fn mouse_move(&mut self, col: u16, row: u16) {
         if self.dragging {
-            self.cursor_col = col.min(self.cols.saturating_sub(1));
-            self.cursor_row = row.min(self.rows.saturating_sub(1));
+            let Some((col, row)) = self.nearest_text_cell(col, row) else {
+                return;
+            };
+            if self.word_dragging {
+                self.extend_word_selection(col, row);
+            } else {
+                self.cursor_col = self.lead_col(col, row);
+                self.cursor_row = row;
+            }
         }
+    }
+
+    fn extend_word_selection(&mut self, col: u16, row: u16) {
+        let Some((target_start, target_end)) = self.word_bounds(col, row) else {
+            return;
+        };
+        let Some((origin_start, origin_end)) = self.word_drag_origin else {
+            return;
+        };
+        if (row, target_start) >= (origin_start.1, origin_start.0) {
+            self.anchor = Some(origin_start);
+            self.cursor_col = target_end;
+            self.cursor_row = row;
+        } else {
+            self.anchor = Some((target_start, row));
+            self.cursor_col = origin_end.0;
+            self.cursor_row = origin_end.1;
+        }
+    }
+
+    fn word_bounds(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        if !self.cell_has_text(col, row) {
+            return None;
+        }
+        let row = row.min(self.rows.saturating_sub(1));
+        let mut start = self.lead_col(col.min(self.cols.saturating_sub(1)), row);
+        let mut end = self.char_end_col(start, row);
+        if self.is_word_cell(start, row) {
+            while start > 0 && self.is_word_cell(start - 1, row) {
+                start = self.lead_col(start - 1, row);
+            }
+            while end + 1 < self.cols && self.is_word_cell(end + 1, row) {
+                end = self.char_end_col(end + 1, row);
+            }
+        }
+        Some((start, end))
+    }
+
+    fn char_end_col(&self, col: u16, row: u16) -> u16 {
+        if self
+            .parser
+            .screen()
+            .cell(row, col)
+            .is_some_and(vt100::Cell::is_wide)
+        {
+            (col + 1).min(self.cols.saturating_sub(1))
+        } else {
+            col
+        }
+    }
+
+    pub fn cell_has_text(&self, col: u16, row: u16) -> bool {
+        let row = row.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        self.parser.screen().cell(row, col).is_some_and(|cell| {
+            if cell.is_wide_continuation() {
+                col > 0
+                    && self
+                        .parser
+                        .screen()
+                        .cell(row, col - 1)
+                        .is_some_and(|lead| lead.has_contents() && lead.is_wide())
+            } else {
+                cell.has_contents()
+            }
+        })
+    }
+
+    fn lead_col(&self, col: u16, row: u16) -> u16 {
+        if col > 0
+            && self
+                .parser
+                .screen()
+                .cell(row, col)
+                .is_some_and(vt100::Cell::is_wide_continuation)
+        {
+            col - 1
+        } else {
+            col
+        }
+    }
+
+    fn is_word_cell(&self, col: u16, row: u16) -> bool {
+        let col = self.lead_col(col, row);
+        self.parser.screen().cell(row, col).is_some_and(|cell| {
+            cell.contents()
+                .chars()
+                .any(|ch| ch.is_alphanumeric() || ch == '_')
+        })
+    }
+
+    /// Keeps a drag endpoint on actual text, snapping over blank trailing
+    /// cells to the nearest occupied cell on that row.
+    fn nearest_text_cell(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let row = row.min(self.rows.saturating_sub(1));
+        let col = col.min(self.cols.saturating_sub(1));
+        (0..self.cols)
+            .filter(|&x| self.cell_has_text(x, row))
+            .min_by_key(|&x| x.abs_diff(col))
+            .map(|x| (self.lead_col(x, row), row))
     }
 
     /// Finishes a mouse drag while keeping its highlighted selection active.
     pub fn mouse_up(&mut self) {
         self.dragging = false;
+        self.word_dragging = false;
+        self.word_drag_origin = None;
     }
 
     pub fn is_mouse_selection(&self) -> bool {
@@ -185,6 +322,9 @@ impl CopyMode {
     }
 
     fn in_selection(&self, col: u16, row: u16) -> bool {
+        if !self.cell_has_text(col, row) {
+            return false;
+        }
         let Some(anchor) = self.anchor else {
             return false;
         };

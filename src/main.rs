@@ -1,4 +1,10 @@
-use std::{collections::HashMap, io, io::Write, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -52,6 +58,8 @@ struct App {
     copy_mode: Option<CopyMode>,
     /// Per-projection scrollback view offset (rows above the bottom).
     scroll: HashMap<usize, usize>,
+    /// Previous local left click, used to recognize a double-click.
+    last_click: Option<(Instant, usize, u16, u16)>,
     exit: bool,
 }
 
@@ -79,6 +87,7 @@ impl App {
             rename: None,
             copy_mode: None,
             scroll: HashMap::new(),
+            last_click: None,
             exit: false,
         };
 
@@ -480,10 +489,11 @@ impl App {
         let Some(id) = pane_at(&snap.root, self.workspace_area, mouse.column, mouse.row) else {
             return false;
         };
+        let force_local_selection = mouse.modifiers.contains(KeyModifiers::SHIFT);
         let app_owns_mouse = self.parsers.get(&id).is_some_and(|parser| {
             parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
         });
-        if self.pane_in_alternate_screen(id) || app_owns_mouse {
+        if !force_local_selection && (self.pane_in_alternate_screen(id) || app_owns_mouse) {
             return false;
         }
         let Some(content) = pane_content_rect(&snap.root, self.workspace_area, id) else {
@@ -492,13 +502,36 @@ impl App {
         if !content.contains(Position::new(mouse.column, mouse.row)) {
             return false;
         }
+        let col = mouse.column - content.x;
+        let row = mouse.row - content.y;
+        let now = Instant::now();
+        let double_click =
+            self.last_click
+                .take()
+                .is_some_and(|(last_at, last_id, last_col, last_row)| {
+                    last_id == id
+                        && last_col == col
+                        && last_row == row
+                        && now.duration_since(last_at) <= Duration::from_millis(450)
+                });
+        if !double_click {
+            self.last_click = Some((now, id, col, row));
+        }
         let Some(parser) = self.parsers.get(&id) else {
             return false;
         };
         let Some(mut mode) = CopyMode::new(id, parser) else {
             return false;
         };
-        mode.mouse_down(mouse.column - content.x, mouse.row - content.y);
+        let started = if double_click {
+            mode.select_word_at(col, row)
+        } else {
+            mode.mouse_down(col, row)
+        };
+        if !started {
+            self.last_click = None;
+            return false;
+        }
         self.copy_mode = Some(mode);
         true
     }
