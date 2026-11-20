@@ -686,10 +686,10 @@ fn answer_graphics_query(apc: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
-/// Serializes every scrolled-out row of the pane's main screen as plain text
-/// (one line per grid row, `\r\n` separated) so the client can rebuild the
-/// same history in its own parser. The currently visible rows are not
-/// included; they arrive via `state_formatted`.
+/// Serializes every scrolled-out row of the pane's main screen with its
+/// formatting escape sequences (one line per grid row, `\r\n` separated) so
+/// the client can rebuild the same history in its own parser. The currently
+/// visible rows are not included; they arrive via `state_formatted`.
 ///
 /// Scrollback offset 0 shows the bottom of the screen; `total` is the number
 /// of scrolled-out rows. The walk starts at the top (offset `total`) and works
@@ -706,8 +706,8 @@ fn serialize_history(parser: &mut vt100::Parser) -> Vec<u8> {
     while start < total {
         screen.set_scrollback(total - start);
         let take = (total - start).min(usize::from(rows));
-        for line in screen.rows(0, cols).take(take) {
-            out.extend_from_slice(line.as_bytes());
+        for line in screen.rows_formatted(0, cols).take(take) {
+            out.extend_from_slice(&line);
             out.extend_from_slice(b"\r\n");
         }
         start += take;
