@@ -105,15 +105,15 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
         }
     }
 
-    if let Some(dir) = config_dir {
-        if let Ok(entries) = fs::read_dir(dir) {
-            let mut global_files: Vec<PathBuf> = entries
-                .filter_map(|entry| entry.ok().map(|e| e.path()))
-                .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "harp"))
-                .collect();
-            global_files.sort();
-            files.extend(global_files);
-        }
+    if let Some(dir) = config_dir
+        && let Ok(entries) = fs::read_dir(dir)
+    {
+        let mut global_files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "harp"))
+            .collect();
+        global_files.sort();
+        files.extend(global_files);
     }
 
     let mut seen = HashSet::new();

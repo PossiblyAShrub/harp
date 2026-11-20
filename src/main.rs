@@ -206,15 +206,15 @@ impl App {
 
             if event::poll(Duration::from_millis(16))? {
                 self.handle_events()?;
-            } else if !self.exit {
-                if let Some(snap) = &self.snapshot {
-                    self.client.send(&ClientMsg::Poll {
-                        scope_id: snap.scope_id,
-                        last_revision: snap.revision,
-                    })?;
-                    let reply = self.client.recv::<ServerMsg>()?;
-                    self.handle_server_reply(reply)?;
-                }
+            } else if !self.exit
+                && let Some(snap) = &self.snapshot
+            {
+                self.client.send(&ClientMsg::Poll {
+                    scope_id: snap.scope_id,
+                    last_revision: snap.revision,
+                })?;
+                let reply = self.client.recv::<ServerMsg>()?;
+                self.handle_server_reply(reply)?;
             }
         }
 
@@ -350,15 +350,13 @@ impl App {
                                 &event,
                                 Event::Key(k) if k.kind == KeyEventKind::Release
                             );
-                            if !ignore {
-                                if let Some(snap) = &self.snapshot {
-                                    self.client.send(&ClientMsg::Input {
-                                        scope_id: snap.scope_id,
-                                        event,
-                                    })?;
-                                    let reply = self.client.recv::<ServerMsg>()?;
-                                    self.handle_server_reply(reply)?;
-                                }
+                            if !ignore && let Some(snap) = &self.snapshot {
+                                self.client.send(&ClientMsg::Input {
+                                    scope_id: snap.scope_id,
+                                    event,
+                                })?;
+                                let reply = self.client.recv::<ServerMsg>()?;
+                                self.handle_server_reply(reply)?;
                             }
                         }
                     },

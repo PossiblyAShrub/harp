@@ -347,23 +347,23 @@ impl TileNode {
                 direction,
                 children,
             } => {
-                if *direction == dir.axis() {
-                    if let Some(pos) = children.iter().position(
+                if *direction == dir.axis()
+                    && let Some(pos) = children.iter().position(
                         |c| matches!(c.node, TileNode::Leaf { id, .. } if id == target_id),
-                    ) {
-                        let insert_idx = if dir.insert_before() { pos } else { pos + 1 };
-                        children.insert(
-                            insert_idx,
-                            TileChild {
-                                constraint: Constraint::Fill(1),
-                                node: TileNode::Leaf {
-                                    id: new_id,
-                                    projection: new_projection,
-                                },
+                    )
+                {
+                    let insert_idx = if dir.insert_before() { pos } else { pos + 1 };
+                    children.insert(
+                        insert_idx,
+                        TileChild {
+                            constraint: Constraint::Fill(1),
+                            node: TileNode::Leaf {
+                                id: new_id,
+                                projection: new_projection,
                             },
-                        );
-                        return Ok(());
-                    }
+                        },
+                    );
+                    return Ok(());
                 }
 
                 let mut pending = Some(new_projection);
@@ -696,10 +696,10 @@ impl Scope {
             if let Some(root) = &self.root {
                 let mut rects = Vec::new();
                 root.collect_rects(self.area, &mut rects);
-                if !rects.iter().any(|(id, _, _)| *id == self.focused_id) {
-                    if let Some((id, _, _)) = rects.first() {
-                        self.focused_id = *id;
-                    }
+                if !rects.iter().any(|(id, _, _)| *id == self.focused_id)
+                    && let Some((id, _, _)) = rects.first()
+                {
+                    self.focused_id = *id;
                 }
             }
             self.layout_revision = self.layout_revision.wrapping_add(1);
@@ -863,10 +863,10 @@ impl Scope {
                 Ok(())
             }
             _ => {
-                if let Some(root) = &mut self.root {
-                    if let Some(proj) = root.find_mut(self.focused_id) {
-                        proj.handle_event(event)?;
-                    }
+                if let Some(root) = &mut self.root
+                    && let Some(proj) = root.find_mut(self.focused_id)
+                {
+                    proj.handle_event(event)?;
                 }
                 Ok(())
             }
@@ -883,10 +883,8 @@ fn interval_distance(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> u16 
     let b_end = b_start.saturating_add(b_len);
     if a_end <= b_start {
         b_start - a_end
-    } else if b_end <= a_start {
-        a_start - b_end
     } else {
-        0
+        a_start.saturating_sub(b_end)
     }
 }
 
@@ -943,7 +941,7 @@ fn find_neighbor(
         };
 
         let score = (secondary > 0, primary, secondary);
-        if best.map_or(true, |(_, best_score)| score < best_score) {
+        if best.is_none_or(|(_, best_score)| score < best_score) {
             best = Some((id, score));
         }
     }

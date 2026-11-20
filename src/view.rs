@@ -68,10 +68,10 @@ impl<'a> SnapshotView<'a> {
                 let inner = block.inner(area);
                 block.render(area, buf);
 
-                if let Some(page) = pages.get(*active) {
-                    if let Some(parser) = self.parsers.get(&page.id) {
-                        PseudoTerminal::new(parser.screen()).render(inner, buf);
-                    }
+                if let Some(page) = pages.get(*active)
+                    && let Some(parser) = self.parsers.get(&page.id)
+                {
+                    PseudoTerminal::new(parser.screen()).render(inner, buf);
                 }
             }
         }

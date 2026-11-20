@@ -143,10 +143,10 @@ impl ScopePicker {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selected_program = self.selected_program.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.selected_program + 1 < self.programs.len() {
-                        self.selected_program += 1;
-                    }
+                KeyCode::Down | KeyCode::Char('j')
+                    if self.selected_program + 1 < self.programs.len() =>
+                {
+                    self.selected_program += 1;
                 }
                 _ => {}
             },
@@ -198,7 +198,7 @@ impl Widget for &ScopePicker {
         let list_rows = self.programs.len().max(1) as u16 + 2;
         let error_rows = if self.error.is_some() { 2 } else { 0 };
         let desired_height = 1 + list_rows + 3 + error_rows + 1 + 2;
-        let popup_width = area.width.saturating_sub(4).min(64).max(24);
+        let popup_width = area.width.saturating_sub(4).clamp(24, 64);
         let popup_height = area.height.saturating_sub(2).min(desired_height).max(9);
         let popup = centered_rect(popup_width, popup_height, area);
 

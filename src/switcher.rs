@@ -68,7 +68,7 @@ impl Widget for &ScopeSwitcher {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let list_rows = self.total_items().max(1) as u16 + 2;
         let desired_height = list_rows + 3;
-        let popup_width = area.width.saturating_sub(4).min(72).max(28);
+        let popup_width = area.width.saturating_sub(4).clamp(28, 72);
         let popup_height = area.height.saturating_sub(2).min(desired_height).max(7);
         let x = area.x + area.width.saturating_sub(popup_width) / 2;
         let y = area.y + area.height.saturating_sub(popup_height) / 2;
@@ -220,7 +220,7 @@ impl RenameModal {
 
 impl Widget for &RenameModal {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let popup_width = area.width.saturating_sub(4).min(52).max(24);
+        let popup_width = area.width.saturating_sub(4).clamp(24, 52);
         let popup_height = 6u16.min(area.height.saturating_sub(2)).max(5);
         let x = area.x + area.width.saturating_sub(popup_width) / 2;
         let y = area.y + area.height.saturating_sub(popup_height) / 2;
@@ -296,7 +296,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/harp"),
             pane_count: 2,
         }];
-        let mut switcher = ScopeSwitcher::new(scopes, true);
+        let mut switcher = ScopeSwitcher::new(scopes, 0, true);
         assert_eq!(
             switcher.handle_key(key(KeyCode::Enter)),
             SwitcherAction::Attach(7)
