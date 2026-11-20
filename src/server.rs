@@ -30,6 +30,7 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7420";
 pub struct ClientConnection {
     stream: EncryptedStream,
     _tunnel: Option<Child>,
+    _ssh_control_dir: Option<PathBuf>,
     pending: VecDeque<(String, Instant)>,
     trace: VecDeque<ServerTraceEntry>,
 }
@@ -467,6 +468,7 @@ pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
         return Ok(ClientConnection {
             stream: EncryptedStream::handshake_client(stream)?,
             _tunnel: None,
+            _ssh_control_dir: None,
             pending: VecDeque::new(),
             trace: VecDeque::new(),
         });
@@ -479,6 +481,7 @@ pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
                 return Ok(ClientConnection {
                     stream: EncryptedStream::handshake_client(stream)?,
                     _tunnel: None,
+                    _ssh_control_dir: None,
                     pending: VecDeque::new(),
                     trace: VecDeque::new(),
                 });
@@ -491,6 +494,7 @@ pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
     Ok(ClientConnection {
         stream: EncryptedStream::handshake_client(stream)?,
         _tunnel: None,
+        _ssh_control_dir: None,
         pending: VecDeque::new(),
         trace: VecDeque::new(),
     })
@@ -498,13 +502,30 @@ pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
 
 /// Connect to a machine through OpenSSH. The remote `harp --ensure-server`
 /// command starts the persistent server if needed, then `ssh -N -L` carries
-/// all client protocol traffic over the authenticated SSH connection.
+/// all client protocol traffic over the authenticated SSH connection. SSH
+/// connection sharing keeps authentication reusable across these commands.
 pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
     anyhow::ensure!(!host.trim().is_empty(), "SSH host cannot be empty");
+    // Reuse one authenticated SSH connection for the server probe, optional
+    // binary upload, and forwarding tunnel. Otherwise password/passcode auth
+    // is requested independently by each ssh process.
+    let control_dir = std::env::temp_dir().join(format!("harp-ssh-{}", std::process::id()));
+    std::fs::create_dir_all(&control_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let control_path = control_dir.join("control");
+    let ssh_args = [
+        "-o".to_string(), "ControlMaster=auto".into(),
+        "-o".into(), "ControlPersist=60".into(),
+        "-o".into(), format!("ControlPath={}", control_path.display()),
+    ];
     let remote_ensure = remote_ensure_command();
-    let status = Command::new("ssh").arg(host).arg(&remote_ensure).status()?;
+    let status = Command::new("ssh").args(&ssh_args).arg(host).arg(&remote_ensure).status()?;
     if !status.success() {
-        upload_and_start_remote(host)?;
+        upload_and_start_remote(host, &ssh_args)?;
     }
 
     let reservation = TcpListener::bind("127.0.0.1:0")?;
@@ -512,6 +533,7 @@ pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
     drop(reservation);
 
     let mut tunnel = Command::new("ssh")
+        .args(&ssh_args)
         .arg("-N")
         .arg("-L")
         .arg(format!("127.0.0.1:{local_port}:127.0.0.1:7420"))
@@ -529,6 +551,7 @@ pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
             return Ok(ClientConnection {
                 stream,
                 _tunnel: Some(tunnel),
+                _ssh_control_dir: Some(control_dir),
                 pending: VecDeque::new(),
                 trace: VecDeque::new(),
             });
@@ -546,13 +569,14 @@ pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
 /// Send the currently running executable over SSH when the remote `harp`
 /// command is unavailable. The remote copy is private, executable, and removed
 /// as soon as it has launched the detached server.
-fn upload_and_start_remote(host: &str) -> Result<()> {
+fn upload_and_start_remote(host: &str, ssh_args: &[String]) -> Result<()> {
     let exe = File::open(std::env::current_exe()?)?;
     let script = format!(
         "umask 077; f=$(mktemp /tmp/harp.XXXXXX) || exit 1; cat > \"$f\" || {{ rm -f \"$f\"; exit 1; }}; chmod 700 \"$f\" || {{ rm -f \"$f\"; exit 1; }}; {} \"$f\" --ensure-server; r=$?; rm -f \"$f\"; exit \"$r\"",
         remote_env_prefix()
     );
     let mut child = Command::new("ssh")
+        .args(ssh_args)
         .arg(host)
         .arg("sh")
         .arg("-c")
