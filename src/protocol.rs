@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use crossterm::event::Event;
 use serde::{Deserialize, Serialize};
 
+pub const DEBUG_PROJECTION_PROGRAM: &str = "__harp_server_debug__";
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SplitDir {
     Horizontal,
@@ -50,6 +52,8 @@ pub struct TabPageSnapshot {
     pub scrollback: Vec<u8>,
     /// Whether the application is using the alternate screen buffer.
     pub alternate_screen: bool,
+    #[serde(default)]
+    pub is_debug: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +72,9 @@ pub enum SnapshotNode {
         scrollback: Vec<u8>,
         /// Whether the application is using the alternate screen buffer.
         alternate_screen: bool,
+    },
+    Debug {
+        id: usize,
     },
     Split {
         direction: SplitDir,
@@ -126,6 +133,12 @@ pub enum ClientMsg {
         rows: u16,
     },
     Input {
+        scope_id: u64,
+        event: Event,
+    },
+    /// Input on the interactive fast path. The server processes it without a
+    /// reply; the client's next Poll retrieves the resulting screen state.
+    InputAsync {
         scope_id: u64,
         event: Event,
     },

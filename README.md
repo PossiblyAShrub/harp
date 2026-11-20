@@ -39,6 +39,13 @@ harp --serve --bind 0.0.0.0:7420
 harp --connect <host>:<port>
 ```
 
+For a machine reachable through OpenSSH, use its SSH config alias or
+`user@host`:
+
+```sh
+harp --ssh <ssh-host>
+```
+
 Notably, the servers support 2 major features:
 - Zero-config encryption: All client-server traffic is encrypted with an
   ephemeral X25519 key exchange and ChaCha20-Poly1305 AEAD framing—no accounts,

@@ -25,6 +25,7 @@ mod clipboard;
 mod config;
 mod copymode;
 mod crypto;
+mod debug;
 mod picker;
 mod projections;
 mod protocol;
@@ -34,6 +35,7 @@ mod switcher;
 mod view;
 
 use copymode::{CopyAction, CopyMode};
+#[cfg(test)]
 use crypto::EncryptedStream;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus, SCROLLBACK_LINES};
@@ -45,7 +47,7 @@ use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
 use view::{SnapshotView, pane_at, pane_content_rect};
 
 struct App {
-    client: EncryptedStream,
+    client: server::ClientConnection,
     mode: Mode,
     status: ProjectionStatus,
     default_cwd: PathBuf,
@@ -64,7 +66,7 @@ struct App {
 }
 
 impl App {
-    fn new(client: EncryptedStream, area: Rect) -> Result<Self> {
+    fn new(client: server::ClientConnection, area: Rect) -> Result<Self> {
         let mode = Mode::Managing;
         let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let workspace_area = Rect::new(
@@ -159,6 +161,7 @@ impl App {
                 active_ids.push(*id);
                 self.upsert_parser(*id, *cols, *rows, state, scrollback);
             }
+            SnapshotNode::Debug { .. } => {}
             SnapshotNode::Split { children, .. } => {
                 for child in children {
                     self.sync_parsers(&child.node, active_ids);
@@ -166,14 +169,16 @@ impl App {
             }
             SnapshotNode::Tabs { pages, .. } => {
                 for page in pages {
-                    active_ids.push(page.id);
-                    self.upsert_parser(
-                        page.id,
-                        page.cols,
-                        page.rows,
-                        &page.state,
-                        &page.scrollback,
-                    );
+                    if !page.is_debug {
+                        active_ids.push(page.id);
+                        self.upsert_parser(
+                            page.id,
+                            page.cols,
+                            page.rows,
+                            &page.state,
+                            &page.scrollback,
+                        );
+                    }
                 }
             }
         }
@@ -386,18 +391,17 @@ impl App {
         Ok(())
     }
 
-    /// Sends an event to the server for the focused scope, applying any
-    /// returned snapshot.
+    /// Queues input without waiting on a network round trip. The regular poll
+    /// retrieves the resulting snapshot after the remote process responds.
     fn forward_event(&mut self, event: Event) -> io::Result<()> {
         let Some(snap) = &self.snapshot else {
             return Ok(());
         };
-        self.client.send(&ClientMsg::Input {
+        self.client.send(&ClientMsg::InputAsync {
             scope_id: snap.scope_id,
             event,
         })?;
-        let reply = self.client.recv::<ServerMsg>()?;
-        self.handle_server_reply(reply)
+        Ok(())
     }
 
     /// Event handling while copy mode is active. Copy mode owns all input
@@ -902,7 +906,8 @@ impl Widget for &App {
         .split(area);
 
         if let Some(snap) = &self.snapshot {
-            SnapshotView::new(snap, &self.parsers).render(chunks[0], buf);
+            let trace = self.client.debug_trace();
+            SnapshotView::new(snap, &self.parsers, &trace).render(chunks[0], buf);
         }
         self.status.render(chunks[1], buf);
 
@@ -952,6 +957,7 @@ fn snapshot_alternate_screen(node: &SnapshotNode, id: usize) -> Option<bool> {
             alternate_screen,
             ..
         } => (*leaf_id == id).then_some(*alternate_screen),
+        SnapshotNode::Debug { .. } => None,
         SnapshotNode::Split { children, .. } => children
             .iter()
             .find_map(|child| snapshot_alternate_screen(&child.node, id)),
@@ -1063,12 +1069,21 @@ fn to_nav_dir(dir: NavDirection) -> NavDir {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut serve = false;
+    let mut ensure_server = false;
+    let mut ssh_host: Option<String> = None;
     let mut addr = server::DEFAULT_ADDR.to_string();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--serve" => serve = true,
+            "--ensure-server" => ensure_server = true,
+            "--ssh" => {
+                if let Some(val) = args.get(i + 1) {
+                    ssh_host = Some(val.clone());
+                    i += 1;
+                }
+            }
             "--bind" | "--connect" => {
                 if let Some(val) = args.get(i + 1) {
                     addr = val.clone();
@@ -1084,7 +1099,15 @@ fn main() -> Result<()> {
         return server::run_server(&addr);
     }
 
-    let mut client = server::connect_or_spawn(&addr)?;
+    if ensure_server {
+        drop(server::connect_or_spawn(&addr)?);
+        return Ok(());
+    }
+
+    let mut client = match ssh_host {
+        Some(host) => server::connect_ssh(&host)?,
+        None => server::connect_or_spawn(&addr)?,
+    };
 
     // Report the real terminal's cell size in pixels so the server can put it
     // in the PTY's TIOCGWINSZ and answer size queries. Without it programs
@@ -1316,6 +1339,7 @@ echo E2E_DONE
     fn root_has_leaf_state(root: &SnapshotNode, pred: &dyn Fn(&str) -> bool) -> bool {
         match root {
             SnapshotNode::Leaf { state, .. } => pred(&String::from_utf8_lossy(state)),
+            SnapshotNode::Debug { .. } => false,
             SnapshotNode::Split { children, .. } => {
                 children.iter().any(|c| root_has_leaf_state(&c.node, pred))
             }
@@ -1331,6 +1355,7 @@ echo E2E_DONE
             SnapshotNode::Leaf { state, .. } => {
                 out.push(String::from_utf8_lossy(state).into_owned());
             }
+            SnapshotNode::Debug { .. } => {}
             SnapshotNode::Split { children, .. } => {
                 for c in children {
                     dump_leaf_states(out, &c.node);
@@ -1348,6 +1373,7 @@ echo E2E_DONE
     fn root_has_raw_state(root: &SnapshotNode, pred: &dyn Fn(&[u8]) -> bool) -> bool {
         match root {
             SnapshotNode::Leaf { state, .. } => pred(state),
+            SnapshotNode::Debug { .. } => false,
             SnapshotNode::Split { children, .. } => {
                 children.iter().any(|c| root_has_raw_state(&c.node, pred))
             }

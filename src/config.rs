@@ -4,6 +4,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use crate::protocol::DEBUG_PROJECTION_PROGRAM;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramOption {
     pub label: String,
@@ -27,6 +29,7 @@ pub fn default_programs() -> Vec<ProgramOption> {
         ProgramOption::new("ZSH", "zsh"),
         ProgramOption::new("Neovim", "nvim"),
         ProgramOption::new("lazygit", "lazygit"),
+        ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
     ]
 }
 
@@ -132,10 +135,16 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
     }
 
     if result.is_empty() {
-        default_programs()
-    } else {
-        result
+        return default_programs();
     }
+
+    if !result
+        .iter()
+        .any(|program| program.program == DEBUG_PROJECTION_PROGRAM)
+    {
+        result.push(ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM));
+    }
+    result
 }
 
 #[cfg(test)]

@@ -9,18 +9,31 @@ use ratatui::{
 };
 use tui_term::{vt100, widget::PseudoTerminal};
 
-use crate::protocol::{ScopeSnapshot, SnapshotNode, SplitDir, TabPageSnapshot};
+use crate::{
+    debug::ServerDebugProjection,
+    protocol::{ScopeSnapshot, SnapshotNode, SplitDir, TabPageSnapshot},
+    server::ServerTraceEntry,
+};
 
 /// Renders a [`ScopeSnapshot`] as a tree of tile nodes. The snapshot's root is
 /// rendered by the exact same code path as every other node.
 pub struct SnapshotView<'a> {
     snap: &'a ScopeSnapshot,
     parsers: &'a HashMap<usize, vt100::Parser>,
+    trace: &'a [ServerTraceEntry],
 }
 
 impl<'a> SnapshotView<'a> {
-    pub fn new(snap: &'a ScopeSnapshot, parsers: &'a HashMap<usize, vt100::Parser>) -> Self {
-        Self { snap, parsers }
+    pub fn new(
+        snap: &'a ScopeSnapshot,
+        parsers: &'a HashMap<usize, vt100::Parser>,
+        trace: &'a [ServerTraceEntry],
+    ) -> Self {
+        Self {
+            snap,
+            parsers,
+            trace,
+        }
     }
 
     fn render_node(&self, node: &SnapshotNode, area: Rect, buf: &mut Buffer) {
@@ -38,6 +51,9 @@ impl<'a> SnapshotView<'a> {
                 if let Some(parser) = self.parsers.get(id) {
                     PseudoTerminal::new(parser.screen()).render(inner, buf);
                 }
+            }
+            SnapshotNode::Debug { .. } => {
+                ServerDebugProjection::new(self.trace).render(area, buf);
             }
             SnapshotNode::Split {
                 direction,
@@ -68,10 +84,12 @@ impl<'a> SnapshotView<'a> {
                 let inner = block.inner(area);
                 block.render(area, buf);
 
-                if let Some(page) = pages.get(*active)
-                    && let Some(parser) = self.parsers.get(&page.id)
-                {
-                    PseudoTerminal::new(parser.screen()).render(inner, buf);
+                if let Some(page) = pages.get(*active) {
+                    if page.is_debug {
+                        ServerDebugProjection::new(self.trace).render(inner, buf);
+                    } else if let Some(parser) = self.parsers.get(&page.id) {
+                        PseudoTerminal::new(parser.screen()).render(inner, buf);
+                    }
                 }
             }
         }
@@ -91,7 +109,7 @@ pub fn pane_at(node: &SnapshotNode, area: Rect, x: u16, y: u16) -> Option<usize>
         return None;
     }
     match node {
-        SnapshotNode::Leaf { id, .. } => Some(*id),
+        SnapshotNode::Leaf { id, .. } | SnapshotNode::Debug { id } => Some(*id),
         SnapshotNode::Split {
             direction,
             children,
@@ -118,10 +136,12 @@ pub fn pane_at(node: &SnapshotNode, area: Rect, x: u16, y: u16) -> Option<usize>
 /// [`SnapshotView::render_node`] so mouse coordinates map to parser cells.
 pub fn pane_content_rect(node: &SnapshotNode, area: Rect, id: usize) -> Option<Rect> {
     match node {
-        SnapshotNode::Leaf { id: leaf_id, .. } if *leaf_id == id => {
+        SnapshotNode::Leaf { id: leaf_id, .. } | SnapshotNode::Debug { id: leaf_id }
+            if *leaf_id == id =>
+        {
             Some(Block::bordered().inner(area))
         }
-        SnapshotNode::Leaf { .. } => None,
+        SnapshotNode::Leaf { .. } | SnapshotNode::Debug { .. } => None,
         SnapshotNode::Split {
             direction,
             children,
@@ -227,6 +247,7 @@ mod tests {
                     state: Vec::new(),
                     scrollback: Vec::new(),
                     alternate_screen: false,
+                    is_debug: false,
                 },
                 TabPageSnapshot {
                     id: 2,
@@ -236,6 +257,7 @@ mod tests {
                     state: Vec::new(),
                     scrollback: Vec::new(),
                     alternate_screen: false,
+                    is_debug: false,
                 },
             ],
             active: 1,

@@ -12,7 +12,7 @@ use ratatui::{
 
 use crate::{
     projections::ProjectionTerm,
-    protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
+    protocol::{DEBUG_PROJECTION_PROGRAM, ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,28 +55,41 @@ impl NavDirection {
 
 pub enum Projection {
     Term(ProjectionTerm),
+    ServerDebug,
 }
 
 impl Projection {
+    fn from_spec(spec: &ScopeSpec, cols: u16, rows: u16, cell_px: (u16, u16)) -> Result<Self> {
+        if spec.program == DEBUG_PROJECTION_PROGRAM {
+            return Ok(Projection::ServerDebug);
+        }
+        let mut term = ProjectionTerm::with_command(cols, rows, &spec.program, &spec.cwd)?;
+        term.set_cell_size(cell_px.0, cell_px.1)?;
+        Ok(Projection::Term(term))
+    }
+
     fn is_exited(&self) -> bool {
         match self {
             Projection::Term(term) => term.is_exited(),
+            Projection::ServerDebug => false,
         }
     }
 
     fn needs_border(&self) -> bool {
-        matches!(self, Projection::Term(_))
+        true
     }
 
     fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.set_cell_size(w, h),
+            Projection::ServerDebug => Ok(()),
         }
     }
 
     fn take_passthrough(&mut self) -> Vec<u8> {
         match self {
             Projection::Term(term) => term.take_passthrough(),
+            Projection::ServerDebug => Vec::new(),
         }
     }
 
@@ -86,30 +99,35 @@ impl Projection {
                 let inner = pane_inner(rect);
                 term.resize(inner.width, inner.height)
             }
+            Projection::ServerDebug => Ok(()),
         }
     }
 
     fn handle_event(&mut self, event: &Event) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_event(event),
+            Projection::ServerDebug => Ok(()),
         }
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_mouse_event(mouse_event),
+            Projection::ServerDebug => Ok(()),
         }
     }
 
     fn prune_exited(&mut self) -> io::Result<bool> {
         match self {
             Projection::Term(_) => Ok(false),
+            Projection::ServerDebug => Ok(false),
         }
     }
 
     fn revision(&self) -> u64 {
         match self {
             Projection::Term(term) => term.revision(),
+            Projection::ServerDebug => 0,
         }
     }
 }
@@ -254,9 +272,7 @@ impl TileNode {
 
     fn term_revision_sum(&self) -> u64 {
         match self {
-            TileNode::Leaf { projection, .. } => match projection {
-                Projection::Term(term) => term.revision(),
-            },
+            TileNode::Leaf { projection, .. } => projection.revision(),
             TileNode::Split { children, .. } => children
                 .iter()
                 .map(|c| c.node.term_revision_sum())
@@ -278,18 +294,20 @@ impl TileNode {
 
     fn to_snapshot(&self) -> Option<SnapshotNode> {
         match self {
-            TileNode::Leaf { id, projection } => {
-                let Projection::Term(term) = projection;
-                let (cols, rows, state, scrollback, alternate_screen) = term.state_snapshot();
-                Some(SnapshotNode::Leaf {
-                    id: *id,
-                    cols,
-                    rows,
-                    state,
-                    scrollback,
-                    alternate_screen,
-                })
-            }
+            TileNode::Leaf { id, projection } => match projection {
+                Projection::Term(term) => {
+                    let (cols, rows, state, scrollback, alternate_screen) = term.state_snapshot();
+                    Some(SnapshotNode::Leaf {
+                        id: *id,
+                        cols,
+                        rows,
+                        state,
+                        scrollback,
+                        alternate_screen,
+                    })
+                }
+                Projection::ServerDebug => Some(SnapshotNode::Debug { id: *id }),
+            },
             TileNode::Split {
                 direction,
                 children,
@@ -322,19 +340,31 @@ impl TileNode {
             TileNode::Tabs { pages, active } => {
                 let snap_pages: Vec<crate::protocol::TabPageSnapshot> = pages
                     .iter()
-                    .map(|page| {
-                        let Projection::Term(term) = &page.projection;
-                        let (cols, rows, state, scrollback, alternate_screen) =
-                            term.state_snapshot();
-                        crate::protocol::TabPageSnapshot {
-                            id: page.id,
-                            name: term.title(),
-                            cols,
-                            rows,
-                            state,
-                            scrollback,
-                            alternate_screen,
+                    .map(|page| match &page.projection {
+                        Projection::Term(term) => {
+                            let (cols, rows, state, scrollback, alternate_screen) =
+                                term.state_snapshot();
+                            crate::protocol::TabPageSnapshot {
+                                id: page.id,
+                                name: term.title(),
+                                cols,
+                                rows,
+                                state,
+                                scrollback,
+                                alternate_screen,
+                                is_debug: false,
+                            }
                         }
+                        Projection::ServerDebug => crate::protocol::TabPageSnapshot {
+                            id: page.id,
+                            name: "Server Debug".to_string(),
+                            cols: 1,
+                            rows: 1,
+                            state: Vec::new(),
+                            scrollback: Vec::new(),
+                            alternate_screen: false,
+                            is_debug: true,
+                        },
                     })
                     .collect();
                 if snap_pages.is_empty() {
@@ -801,15 +831,10 @@ impl Scope {
     pub fn split_focused_with_spec(&mut self, dir: NavDirection, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let mut term =
-                ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
-            term.set_cell_size(self.cell_px.0, self.cell_px.1)?;
+            let projection = Projection::from_spec(spec, inner.width, inner.height, self.cell_px)?;
             let id = self.next_id;
             self.next_id += 1;
-            self.root = Some(TileNode::Leaf {
-                id,
-                projection: Projection::Term(term),
-            });
+            self.root = Some(TileNode::Leaf { id, projection });
             self.focused_id = id;
             return Ok(());
         };
@@ -817,9 +842,7 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let mut placeholder = ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?;
-        placeholder.set_cell_size(self.cell_px.0, self.cell_px.1)?;
-        let placeholder = Projection::Term(placeholder);
+        let placeholder = Projection::from_spec(spec, 1, 1, self.cell_px)?;
         if root
             .split_leaf(self.focused_id, dir, new_id, placeholder)
             .is_ok()
@@ -835,24 +858,17 @@ impl Scope {
     pub fn new_tab_with_spec(&mut self, spec: &ScopeSpec) -> Result<()> {
         let Some(root) = &mut self.root else {
             let inner = pane_inner(self.area);
-            let mut term =
-                ProjectionTerm::with_command(inner.width, inner.height, &spec.program, &spec.cwd)?;
-            term.set_cell_size(self.cell_px.0, self.cell_px.1)?;
+            let projection = Projection::from_spec(spec, inner.width, inner.height, self.cell_px)?;
             let id = self.next_id;
             self.next_id += 1;
-            self.root = Some(TileNode::Leaf {
-                id,
-                projection: Projection::Term(term),
-            });
+            self.root = Some(TileNode::Leaf { id, projection });
             self.focused_id = id;
             return Ok(());
         };
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let mut placeholder = ProjectionTerm::with_command(1, 1, &spec.program, &spec.cwd)?;
-        placeholder.set_cell_size(self.cell_px.0, self.cell_px.1)?;
-        let placeholder = Projection::Term(placeholder);
+        let placeholder = Projection::from_spec(spec, 1, 1, self.cell_px)?;
         if root.new_tab(self.focused_id, new_id, placeholder).is_ok() {
             self.focused_id = new_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);

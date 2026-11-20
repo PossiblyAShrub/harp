@@ -1,10 +1,13 @@
 use std::{
+    collections::VecDeque,
+    fs::File,
+    io::Write,
     net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -20,6 +23,68 @@ use crate::{
 };
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7420";
+
+/// A client connection and, for SSH connections, the tunnel that carries it.
+/// Keeping the child here makes the forwarding process live exactly as long as
+/// the client session.
+pub struct ClientConnection {
+    stream: EncryptedStream,
+    _tunnel: Option<Child>,
+    pending: VecDeque<(String, Instant)>,
+    trace: VecDeque<ServerTraceEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerTraceEntry {
+    pub request: String,
+    pub response: String,
+    pub latency: Duration,
+}
+
+impl ClientConnection {
+    pub fn send<T: serde::Serialize>(&mut self, value: &T) -> std::io::Result<()> {
+        let label = message_label(value);
+        self.stream.send(value)?;
+        if label != "InputAsync" {
+            self.pending.push_back((label, Instant::now()));
+        }
+        Ok(())
+    }
+
+    pub fn recv<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &mut self,
+    ) -> std::io::Result<T> {
+        let value: T = self.stream.recv()?;
+        let response = message_label(&value);
+        if let Some((request, started)) = self.pending.pop_front() {
+            self.trace.push_back(ServerTraceEntry {
+                request,
+                response,
+                latency: started.elapsed(),
+            });
+            while self.trace.len() > 500 {
+                self.trace.pop_front();
+            }
+        }
+        Ok(value)
+    }
+
+    pub fn debug_trace(&self) -> Vec<ServerTraceEntry> {
+        self.trace.iter().cloned().collect()
+    }
+}
+
+fn message_label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_object().and_then(|map| map.keys().next().cloned()))
+        })
+        .unwrap_or_else(|| "Message".to_string())
+}
 
 struct ServerScope {
     id: u64,
@@ -184,7 +249,7 @@ impl ServerState {
                     None => ServerMsg::ScopeClosed,
                 }
             }
-            ClientMsg::Input { scope_id, event } => {
+            ClientMsg::Input { scope_id, event } | ClientMsg::InputAsync { scope_id, event } => {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
                 };
@@ -302,13 +367,14 @@ pub fn run_server(bind_addr: &str) -> Result<()> {
                         return;
                     };
                     while let Ok(msg) = encrypted.recv::<ClientMsg>() {
+                        let reply_expected = !matches!(&msg, ClientMsg::InputAsync { .. });
                         let (reply, exit_after) = {
                             let mut guard = state.lock().unwrap();
                             let reply = guard.handle_msg(msg);
                             let exit_after = guard.should_exit();
                             (reply, exit_after)
                         };
-                        if encrypted.send(&reply).is_err() || exit_after {
+                        if (reply_expected && encrypted.send(&reply).is_err()) || exit_after {
                             break;
                         }
                     }
@@ -330,23 +396,152 @@ pub fn run_server(bind_addr: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn connect_or_spawn(addr: &str) -> Result<EncryptedStream> {
+pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
     if let Ok(stream) = TcpStream::connect(addr) {
-        return Ok(EncryptedStream::handshake_client(stream)?);
+        return Ok(ClientConnection {
+            stream: EncryptedStream::handshake_client(stream)?,
+            _tunnel: None,
+            pending: VecDeque::new(),
+            trace: VecDeque::new(),
+        });
     }
 
     if is_local_addr(addr) {
         spawn_background_server(addr)?;
         for _ in 0..40 {
             if let Ok(stream) = TcpStream::connect(addr) {
-                return Ok(EncryptedStream::handshake_client(stream)?);
+                return Ok(ClientConnection {
+                    stream: EncryptedStream::handshake_client(stream)?,
+                    _tunnel: None,
+                    pending: VecDeque::new(),
+                    trace: VecDeque::new(),
+                });
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
     let stream = TcpStream::connect(addr)?;
-    Ok(EncryptedStream::handshake_client(stream)?)
+    Ok(ClientConnection {
+        stream: EncryptedStream::handshake_client(stream)?,
+        _tunnel: None,
+        pending: VecDeque::new(),
+        trace: VecDeque::new(),
+    })
+}
+
+/// Connect to a machine through OpenSSH. The remote `harp --ensure-server`
+/// command starts the persistent server if needed, then `ssh -N -L` carries
+/// all client protocol traffic over the authenticated SSH connection.
+pub fn connect_ssh(host: &str) -> Result<ClientConnection> {
+    anyhow::ensure!(!host.trim().is_empty(), "SSH host cannot be empty");
+    let remote_ensure = remote_ensure_command();
+    let status = Command::new("ssh").arg(host).arg(&remote_ensure).status()?;
+    if !status.success() {
+        upload_and_start_remote(host)?;
+    }
+
+    let reservation = TcpListener::bind("127.0.0.1:0")?;
+    let local_port = reservation.local_addr()?.port();
+    drop(reservation);
+
+    let mut tunnel = Command::new("ssh")
+        .arg("-N")
+        .arg("-L")
+        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:7420"))
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let addr = format!("127.0.0.1:{local_port}");
+    for _ in 0..100 {
+        if let Ok(stream) = TcpStream::connect(&addr) {
+            match EncryptedStream::handshake_client(stream) {
+                Ok(stream) => {
+                    return Ok(ClientConnection {
+                        stream,
+                        _tunnel: Some(tunnel),
+                        pending: VecDeque::new(),
+                        trace: VecDeque::new(),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(status) = tunnel.try_wait()? {
+            anyhow::bail!("SSH tunnel exited before connecting ({status})");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = tunnel.kill();
+    let _ = tunnel.wait();
+    anyhow::bail!("timed out opening SSH tunnel to {host}")
+}
+
+/// Send the currently running executable over SSH when the remote `harp`
+/// command is unavailable. The remote copy is private, executable, and removed
+/// as soon as it has launched the detached server.
+fn upload_and_start_remote(host: &str) -> Result<()> {
+    let exe = File::open(std::env::current_exe()?)?;
+    let script = format!(
+        "umask 077; f=$(mktemp /tmp/harp.XXXXXX) || exit 1; cat > \"$f\" || {{ rm -f \"$f\"; exit 1; }}; chmod 700 \"$f\" || {{ rm -f \"$f\"; exit 1; }}; {} \"$f\" --ensure-server; r=$?; rm -f \"$f\"; exit \"$r\"",
+        remote_env_prefix()
+    );
+    let mut child = Command::new("ssh")
+        .arg(host)
+        .arg("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("could not open SSH upload stream"))?;
+    let mut exe = exe;
+    std::io::copy(&mut exe, &mut stdin)?;
+    stdin.flush()?;
+    drop(stdin);
+    let status = child.wait()?;
+    anyhow::ensure!(
+        status.success(),
+        "could not upload and start Harp on SSH host {host}; the binary must match the remote machine's operating system and CPU architecture"
+    );
+    Ok(())
+}
+
+fn remote_ensure_command() -> String {
+    format!("{} harp --ensure-server", remote_env_prefix())
+}
+
+/// Preserve the local terminal type and UTF-8 locale when the SSH command
+/// starts the remote server without allocating a terminal.
+fn remote_env_prefix() -> String {
+    [
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "COLORTERM",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| format!("{name}={}", shell_quote(&value)))
+    })
+    .fold("env".to_string(), |prefix, assignment| {
+        format!("{prefix} {assignment}")
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn is_local_addr(addr: &str) -> bool {

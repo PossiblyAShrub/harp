@@ -3,12 +3,14 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
 };
+
+#[cfg(test)]
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -105,7 +107,7 @@ impl Widget for &ProjectionStatus {
                         .fg(Color::Black)
                         .bg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: custom | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
+                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: projection | Alt+Arrows: tabs | t/Shift+t: new tab | s: scopes | r: rename | q: detach",
                 ),
             };
 
@@ -136,7 +138,6 @@ pub struct ProjectionTerm {
     parser: Arc<Mutex<vt100::Parser>>,
     exited: Arc<AtomicBool>,
     revision: Arc<AtomicU64>,
-    notify: Arc<(Mutex<u64>, Condvar)>,
     size: (u16, u16),
     program: String,
     /// Character cell size in pixels, as reported by the real terminal. Used
@@ -180,12 +181,17 @@ impl ProjectionTerm {
 
         let mut cmd = CommandBuilder::new(program);
         cmd.cwd(cwd);
+        // SSH-started servers have no controlling terminal and may not receive
+        // TERM from sshd. Give child applications a usable terminal type in
+        // that case; locale variables still come from the server environment.
+        if std::env::var_os("TERM").is_none() {
+            cmd.env("TERM", "xterm-256color");
+        }
         let mut child = pty.slave.spawn_command(cmd)?;
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let exited = Arc::new(AtomicBool::new(false));
         let revision = Arc::new(AtomicU64::new(1));
-        let notify = Arc::new((Mutex::new(0u64), Condvar::new()));
 
         let mut reader = pty.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(Some(pty.master.take_writer()?)));
@@ -194,7 +200,6 @@ impl ProjectionTerm {
         let parser_clone = Arc::clone(&parser);
         let exited_clone = Arc::clone(&exited);
         let revision_clone = Arc::clone(&revision);
-        let notify_clone = Arc::clone(&notify);
         let writer_clone = Arc::clone(&writer);
         let cell_px_clone = Arc::clone(&cell_px);
         let passthrough_clone = Arc::clone(&passthrough);
@@ -241,19 +246,11 @@ impl ProjectionTerm {
                         .extend_from_slice(&passthrough);
                 }
                 revision_clone.fetch_add(1, Ordering::Release);
-                let (lock, cvar) = &*notify_clone;
-                let mut seq = lock.lock().unwrap();
-                *seq = seq.wrapping_add(1);
-                cvar.notify_all();
             }
 
             let _ = child.wait();
             exited_clone.store(true, Ordering::Release);
             revision_clone.fetch_add(1, Ordering::Release);
-            let (lock, cvar) = &*notify_clone;
-            let mut seq = lock.lock().unwrap();
-            *seq = seq.wrapping_add(1);
-            cvar.notify_all();
         });
 
         Ok(Self {
@@ -262,7 +259,6 @@ impl ProjectionTerm {
             parser,
             exited,
             revision,
-            notify,
             size: (cols, rows),
             program: program.to_string(),
             cell_px,
@@ -325,16 +321,10 @@ impl ProjectionTerm {
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> io::Result<()> {
         let application_cursor = self.parser.lock().unwrap().screen().application_cursor();
         if let Some(bytes) = encode_key_event(key_event, application_cursor) {
-            let seq = *self.notify.0.lock().unwrap();
             if let Some(writer) = self.writer.lock().unwrap().as_mut() {
                 writer.write_all(&bytes)?;
                 writer.flush()?;
             }
-            let guard = self.notify.0.lock().unwrap();
-            let _ = self
-                .notify
-                .1
-                .wait_timeout_while(guard, Duration::from_millis(12), |s| *s == seq);
         }
 
         Ok(())
