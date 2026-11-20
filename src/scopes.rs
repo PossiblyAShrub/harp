@@ -717,7 +717,9 @@ impl Scope {
         let passthrough = self
             .root
             .as_mut()
-            .map_or(Vec::new(), TileNode::drain_passthrough);
+            .map_or_else(Vec::new, TileNode::drain_passthrough);
+        // The bytes are always ASCII (base64 payloads in APC escape codes).
+        let passthrough = String::from_utf8_lossy(&passthrough).into_owned();
         let root = self.root.as_ref()?.to_snapshot()?;
         Some(ScopeSnapshot {
             scope_id,

@@ -84,7 +84,9 @@ pub struct ScopeSnapshot {
     pub root: SnapshotNode,
     /// Terminal escape sequences (e.g. kitty graphics protocol APC codes) that
     /// the client must write through to the real terminal for display.
-    pub passthrough: Vec<u8>,
+    /// Always ASCII (base64 payloads), so a `String` keeps the JSON framing
+    /// compact instead of one array entry per byte.
+    pub passthrough: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

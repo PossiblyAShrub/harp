@@ -193,7 +193,7 @@ impl App {
                 // graphics protocol) to the real terminal for display.
                 if !snap.passthrough.is_empty() {
                     let mut stdout = io::stdout().lock();
-                    let _ = stdout.write_all(&snap.passthrough);
+                    let _ = stdout.write_all(snap.passthrough.as_bytes());
                     let _ = stdout.flush();
                 }
                 self.apply_snapshot(snap);
