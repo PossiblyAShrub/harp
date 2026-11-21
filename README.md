@@ -69,6 +69,12 @@ A scope is a collection of "projections". A scope lives on a local
 machine or a remote machine. You can switch scopes within a session, or quit
 your client while a scope continues in the background.
 
+Open the scope switcher with `s` and choose **Add SSH Host** to connect another
+Harp node. Harp saves peer hosts in the local server's `~/.config/harp/peers.json`
+catalog. The switcher lists scopes from each connected host and offers a
+per-host **New Scope** entry. Remote scopes keep running on their owner node
+when the client detaches, so they can be resumed from the switcher later.
+
 Projections are individual applications that live in a scope. They may be a
 terminal, an editor, or a custom tool that belongs to a workspace.
 

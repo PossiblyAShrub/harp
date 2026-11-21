@@ -1,8 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     io,
     io::Write,
     path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -18,7 +20,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
     prelude::Buffer,
-    widgets::Widget,
+    widgets::{Block, Clear, Paragraph, Widget},
 };
 use tui_term::vt100;
 
@@ -41,7 +43,7 @@ use drag::Drag;
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus, SCROLLBACK_LINES};
 use protocol::{
-    ClientMsg, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir,
+    ClientMsg, HostInfo, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir,
 };
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
@@ -49,6 +51,18 @@ use view::{SnapshotView, pane_at, pane_content_rect};
 
 struct App {
     client: server::ClientConnection,
+    local_server_addr: String,
+    hosts: Vec<HostInfo>,
+    host_prompt: Option<String>,
+    askpass_broker: server::AskpassBroker,
+    askpass_prompt: Option<server::AskpassRequest>,
+    askpass_visible: bool,
+    queued_askpass: VecDeque<server::AskpassRequest>,
+    askpass_value: String,
+    peer_tx: Sender<(HostInfo, Result<server::ClientConnection>)>,
+    peer_rx: Receiver<(HostInfo, Result<server::ClientConnection>)>,
+    connecting_hosts: HashSet<String>,
+    pending_create_host: Option<String>,
     mode: Mode,
     status: ProjectionStatus,
     default_cwd: PathBuf,
@@ -69,7 +83,12 @@ struct App {
 }
 
 impl App {
-    fn new(client: server::ClientConnection, area: Rect) -> Result<Self> {
+    fn new(
+        client: server::ClientConnection,
+        hosts: Vec<HostInfo>,
+        local_server_addr: String,
+        area: Rect,
+    ) -> Result<Self> {
         let mode = Mode::Managing;
         let default_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let workspace_area = Rect::new(
@@ -79,8 +98,22 @@ impl App {
             area.height.saturating_sub(1).max(1),
         );
 
+        let askpass_broker = server::AskpassBroker::new(std::env::current_exe()?)?;
+        let (peer_tx, peer_rx) = mpsc::channel();
         let mut app = Self {
             client,
+            local_server_addr,
+            hosts,
+            host_prompt: None,
+            askpass_broker,
+            askpass_prompt: None,
+            askpass_visible: false,
+            queued_askpass: VecDeque::new(),
+            askpass_value: String::new(),
+            peer_tx,
+            peer_rx,
+            connecting_hosts: HashSet::new(),
+            pending_create_host: None,
             mode,
             status: ProjectionStatus::new(mode),
             default_cwd: default_cwd.clone(),
@@ -97,14 +130,18 @@ impl App {
             pending_q: None,
             exit: false,
         };
-
         app.client.send(&ClientMsg::ListScopes)?;
         match app.client.recv::<ServerMsg>()? {
-            ServerMsg::Scopes(scopes) if scopes.is_empty() => {
+            ServerMsg::Scopes(scopes) if scopes.is_empty() && app.hosts.is_empty() => {
                 app.create_new_scope()?;
             }
             ServerMsg::Scopes(scopes) => {
-                app.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
+                app.switcher = Some(ScopeSwitcher::with_hosts(
+                    scopes,
+                    app.hosts.clone(),
+                    0,
+                    false,
+                ));
             }
             ServerMsg::Error(e) => {
                 app.status.set_error(Some(e));
@@ -112,7 +149,77 @@ impl App {
             _ => {}
         }
 
+        let saved_hosts = app.hosts.clone();
+        for host in saved_hosts {
+            app.start_peer_connection(host);
+        }
+
         Ok(app)
+    }
+
+    fn start_peer_connection(&mut self, host: HostInfo) {
+        if self.connecting_hosts.contains(&host.ssh_host) {
+            if self.askpass_prompt.is_some() {
+                self.askpass_visible = true;
+                self.status.set_error(None);
+            }
+            return;
+        }
+        if self.client.peer_connected(&host.ssh_host) {
+            return;
+        }
+        self.connecting_hosts.insert(host.ssh_host.clone());
+        let tx = self.peer_tx.clone();
+        let config = self.askpass_broker.config();
+        let local_addr = self.local_server_addr.clone();
+        thread::spawn(move || {
+            let result = server::connect_ssh_with_askpass(&host.ssh_host, &config, &local_addr);
+            let _ = tx.send((host, result));
+        });
+    }
+
+    fn process_background(&mut self) -> io::Result<()> {
+        while let Some(request) = self.askpass_broker.try_recv() {
+            if self.askpass_prompt.is_some() {
+                self.queued_askpass.push_back(request);
+            } else {
+                self.askpass_prompt = Some(request);
+                self.askpass_visible = true;
+            }
+        }
+        while let Ok((host, result)) = self.peer_rx.try_recv() {
+            self.connecting_hosts.remove(&host.ssh_host);
+            match result {
+                Ok(connection) => {
+                    if let Err(error) = self.client.add_peer_connection(host.clone(), connection) {
+                        self.status.set_error(Some(error.to_string()));
+                    } else if self.pending_create_host.as_deref() == Some(&host.ssh_host) {
+                        self.status.set_error(None);
+                        self.pending_create_host = None;
+                        self.create_scope_on(host.ssh_host.clone())?;
+                    } else {
+                        self.status.set_error(None);
+                    }
+                }
+                Err(error) => {
+                    self.status
+                        .set_error(Some(format!("{}: {error}", host.name)));
+                    if self.pending_create_host.as_deref() == Some(&host.ssh_host) {
+                        self.pending_create_host = None;
+                    }
+                }
+            }
+            if self.switcher.is_some() || self.snapshot.is_none() {
+                self.open_switcher(false)?;
+            }
+        }
+        if self.askpass_prompt.is_none() {
+            self.askpass_prompt = self.queued_askpass.pop_front();
+            if self.askpass_prompt.is_some() {
+                self.askpass_visible = true;
+            }
+        }
+        Ok(())
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -196,7 +303,14 @@ impl App {
         self.sync_parsers(&snap.root, &mut active_ids);
         self.parsers.retain(|id, _| active_ids.contains(id));
         self.scroll.retain(|id, _| active_ids.contains(id));
-        self.status.set_scope_name(Some(snap.scope_name.clone()));
+        let owner_idx = (snap.scope_id >> 48) as usize;
+        let owner = owner_idx
+            .checked_sub(1)
+            .and_then(|idx| self.client.peer_name(idx));
+        self.status.set_scope_name(Some(owner.map_or_else(
+            || snap.scope_name.clone(),
+            |host| format!("{host} · {}", snap.scope_name),
+        )));
         self.snapshot = Some(snap);
 
         // Re-apply each projection's saved scroll position onto its parser.
@@ -306,9 +420,14 @@ impl App {
                 self.scroll.clear();
                 self.client.send(&ClientMsg::ListScopes)?;
                 match self.client.recv::<ServerMsg>()? {
-                    ServerMsg::Scopes(scopes) if !scopes.is_empty() => {
+                    ServerMsg::Scopes(scopes) if !scopes.is_empty() || !self.hosts.is_empty() => {
                         self.set_mode(Mode::Managing);
-                        self.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
+                        self.switcher = Some(ScopeSwitcher::with_hosts(
+                            scopes,
+                            self.hosts.clone(),
+                            0,
+                            false,
+                        ));
                     }
                     _ => {
                         self.exit = true;
@@ -324,13 +443,21 @@ impl App {
                 self.parsers.clear();
                 self.scroll.clear();
                 self.copy_mode = None;
-                if scopes.is_empty() {
+                if scopes.is_empty() && self.hosts.is_empty() {
                     self.status.set_scope_name(None);
                     self.exit = true;
                 } else {
                     self.set_mode(Mode::Managing);
-                    self.switcher = Some(ScopeSwitcher::new(scopes, 0, false));
+                    self.switcher = Some(ScopeSwitcher::with_hosts(
+                        scopes,
+                        self.hosts.clone(),
+                        0,
+                        false,
+                    ));
                 }
+            }
+            ServerMsg::Hosts(hosts) => {
+                self.hosts = hosts;
             }
         }
         Ok(())
@@ -338,6 +465,17 @@ impl App {
 
     fn create_new_scope(&mut self) -> io::Result<()> {
         self.client.send(&ClientMsg::CreateScope {
+            cwd: self.default_cwd.clone(),
+            cols: self.workspace_area.width,
+            rows: self.workspace_area.height,
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)
+    }
+
+    fn create_scope_on(&mut self, host: String) -> io::Result<()> {
+        self.client.send(&ClientMsg::CreateScopeOn {
+            host,
             cwd: self.default_cwd.clone(),
             cols: self.workspace_area.width,
             rows: self.workspace_area.height,
@@ -367,7 +505,12 @@ impl App {
                     .find(|(_, s)| Some(s.id) == scope_id)
                     .map(|(num, _)| num)
                     .unwrap_or(0);
-                self.switcher = Some(ScopeSwitcher::new(scopes, scope_num, allow_cancel));
+                self.switcher = Some(ScopeSwitcher::with_hosts(
+                    scopes,
+                    self.hosts.clone(),
+                    scope_num,
+                    allow_cancel,
+                ));
             }
             ServerMsg::Error(e) => self.status.set_error(Some(e)),
             _ => {}
@@ -623,6 +766,7 @@ impl App {
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
+            self.process_background()?;
             self.flush_expired_q()?;
             if self.exit {
                 break;
@@ -775,14 +919,124 @@ impl App {
                 false
             };
 
-            if suppress_mouse || self.handle_q_gesture(&event)? {
+            let reopen_askpass = self.askpass_prompt.is_some()
+                && !self.askpass_visible
+                && matches!(&event, Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && key.modifiers == KeyModifiers::NONE
+                        && key.code == KeyCode::Char('p'));
+
+            if reopen_askpass {
+                self.askpass_visible = true;
+                self.status.set_error(None);
+            } else if suppress_mouse
+                || (self.host_prompt.is_none()
+                    && !self.askpass_visible
+                    && self.handle_q_gesture(&event)?)
+            {
                 if self.exit || !event::poll(Duration::ZERO)? {
                     break;
                 }
                 continue;
             }
 
-            if self
+            if self.askpass_prompt.is_some() && self.askpass_visible && !reopen_askpass {
+                if let Event::Key(key) = event
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.askpass_visible = false;
+                            self.status.set_error(Some(
+                                "SSH authentication paused · press p to reopen".to_string(),
+                            ));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(request) = self.askpass_prompt.take() {
+                                request.respond(std::mem::take(&mut self.askpass_value));
+                            }
+                            self.askpass_visible = false;
+                            self.status.set_error(None);
+                        }
+                        KeyCode::Backspace => {
+                            self.askpass_value.pop();
+                        }
+                        KeyCode::Char(ch)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            self.askpass_value.push(ch);
+                        }
+                        _ => {}
+                    }
+                } else if let Event::Paste(text) = event {
+                    self.askpass_value
+                        .extend(text.chars().filter(|ch| !ch.is_control()));
+                }
+            } else if reopen_askpass {
+                // The p key only reopens the waiting prompt.
+            } else if self.host_prompt.is_some() {
+                if let Event::Key(key) = event
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                {
+                    match key.code {
+                        KeyCode::Esc => self.host_prompt = None,
+                        KeyCode::Enter => {
+                            let ssh_host = self
+                                .host_prompt
+                                .take()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            if !ssh_host.is_empty() {
+                                self.client.send(&ClientMsg::AddHost { ssh_host })?;
+                                match self.client.recv::<ServerMsg>()? {
+                                    ServerMsg::Hosts(found) => {
+                                        for host in found {
+                                            if !self
+                                                .hosts
+                                                .iter()
+                                                .any(|known| known.ssh_host == host.ssh_host)
+                                            {
+                                                self.hosts.push(host.clone());
+                                            }
+                                            self.status.set_error(Some(format!(
+                                                "Connecting to {}…",
+                                                host.name
+                                            )));
+                                            self.start_peer_connection(host);
+                                        }
+                                    }
+                                    ServerMsg::Error(error) => self.status.set_error(Some(error)),
+                                    _ => {}
+                                }
+                            } else {
+                                self.open_switcher(false)?;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(prompt) = &mut self.host_prompt {
+                                prompt.pop();
+                            }
+                        }
+                        KeyCode::Char(ch)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            if let Some(prompt) = &mut self.host_prompt {
+                                prompt.push(ch);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Event::Paste(text) = event
+                    && let Some(prompt) = &mut self.host_prompt
+                {
+                    prompt.extend(text.chars().filter(|ch| !ch.is_control()));
+                }
+            } else if self
                 .copy_mode
                 .as_ref()
                 .is_some_and(|mode| !mode.is_mouse_selection() || mode.is_dragging())
@@ -817,6 +1071,26 @@ impl App {
                         SwitcherAction::CreateNew => {
                             self.switcher = None;
                             self.create_new_scope()?;
+                        }
+                        SwitcherAction::CreateNewOn(host) => {
+                            self.switcher = None;
+                            if self.client.peer_connected(&host) {
+                                self.create_scope_on(host)?;
+                            } else if let Some(info) = self
+                                .hosts
+                                .iter()
+                                .find(|item| item.ssh_host == host)
+                                .cloned()
+                            {
+                                self.pending_create_host = Some(host);
+                                self.start_peer_connection(info);
+                            } else {
+                                self.status
+                                    .set_error(Some(format!("Unknown SSH host: {host}")));
+                            }
+                        }
+                        SwitcherAction::AddHost => {
+                            self.host_prompt = Some(String::new());
                         }
                     }
                 }
@@ -1164,6 +1438,29 @@ impl Widget for &App {
         if let Some(rename) = &self.rename {
             rename.render(area, buf);
         }
+        if let Some(host) = &self.host_prompt {
+            let popup = centered_rect(area, 60, 5);
+            Clear.render(popup, buf);
+            let block = Block::bordered().title(" Add SSH Host ");
+            let inner = block.inner(popup);
+            block.render(popup, buf);
+            Paragraph::new(format!("{host}_\nEnter to connect · Esc to cancel")).render(inner, buf);
+        }
+        if self.askpass_visible
+            && let Some(request) = &self.askpass_prompt
+        {
+            let popup = centered_rect(area, 76, 7);
+            Clear.render(popup, buf);
+            let block = Block::bordered().title(" SSH Credential ");
+            let inner = block.inner(popup);
+            block.render(popup, buf);
+            let masked = "•".repeat(self.askpass_value.chars().count());
+            Paragraph::new(format!(
+                "{}\n{}_\nEnter to submit · Esc to dismiss (p to reopen)",
+                request.prompt, masked
+            ))
+            .render(inner, buf);
+        }
     }
 }
 
@@ -1298,8 +1595,30 @@ fn to_nav_dir(dir: NavDirection) -> NavDir {
     }
 }
 
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if std::env::var_os("HARP_ASKPASS_HELPER").is_some() {
+        let config = server::AskpassConfig {
+            program: std::env::current_exe()?,
+            addr: std::env::var("HARP_ASKPASS_ADDR")?,
+            token: std::env::var("HARP_ASKPASS_TOKEN")?,
+        };
+        return server::run_askpass_helper(
+            &config,
+            args.get(1).map(String::as_str).unwrap_or("SSH credential"),
+        );
+    }
     let mut serve = false;
     let mut ensure_server = false;
     let mut ssh_host: Option<String> = None;
@@ -1336,10 +1655,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut client = match ssh_host {
-        Some(host) => server::connect_ssh(&host)?,
-        None => server::connect_or_spawn(&addr)?,
-    };
+    let mut client = server::connect_or_spawn(&addr)?;
 
     // Report the real terminal's cell size in pixels so the server can put it
     // in the PTY's TIOCGWINSZ and answer size queries. Without it programs
@@ -1347,6 +1663,22 @@ fn main() -> Result<()> {
     if let Some((cell_w, cell_h)) = query_pixel_sizes() {
         let _ = client.send(&ClientMsg::SetPixelSize { cell_w, cell_h });
         let _ = client.recv::<ServerMsg>();
+    }
+
+    let mut hosts = Vec::new();
+    client.send(&ClientMsg::ListHosts)?;
+    if let ServerMsg::Hosts(saved_hosts) = client.recv::<ServerMsg>()? {
+        hosts = saved_hosts;
+    }
+    if let Some(ssh_host) = ssh_host {
+        client.send(&ClientMsg::AddHost { ssh_host })?;
+        if let ServerMsg::Hosts(added) = client.recv::<ServerMsg>()? {
+            for host in added {
+                if !hosts.iter().any(|known| known.ssh_host == host.ssh_host) {
+                    hosts.push(host);
+                }
+            }
+        }
     }
 
     ratatui::run(|terminal| {
@@ -1368,7 +1700,7 @@ fn main() -> Result<()> {
 
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
-        let mut app = App::new(client, area).map_err(io::Error::other)?;
+        let mut app = App::new(client, hosts, addr.clone(), area).map_err(io::Error::other)?;
         app.run(terminal)
     })?;
 

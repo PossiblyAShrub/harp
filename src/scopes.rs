@@ -837,6 +837,27 @@ pub struct Scope {
     cell_px: (u16, u16),
 }
 
+fn default_shell_program() -> String {
+    let executable_in_path = |program: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+    };
+    if executable_in_path("zsh") {
+        return "zsh".into();
+    }
+    if let Some(shell) = std::env::var_os("SHELL") {
+        let shell = shell.to_string_lossy().into_owned();
+        if Path::new(&shell).is_file() {
+            return shell;
+        }
+    }
+    if executable_in_path("sh") {
+        "sh".into()
+    } else {
+        "/bin/sh".into()
+    }
+}
+
 impl Scope {
     pub fn from_children(
         direction: Direction,
@@ -893,9 +914,10 @@ impl Scope {
         let constraints = vec![Constraint::Fill(1); count];
         let rects = Layout::new(direction, constraints).split(area);
         let mut children = Vec::with_capacity(count);
+        let program = default_shell_program();
         for rect in rects.iter() {
             let inner = pane_inner(*rect);
-            let mut term = ProjectionTerm::with_command(inner.width, inner.height, "zsh", cwd)?;
+            let mut term = ProjectionTerm::with_command(inner.width, inner.height, &program, cwd)?;
             term.set_cell_size(cell_px.0, cell_px.1)?;
             children.push((Constraint::Fill(1), Projection::Term(term)));
         }

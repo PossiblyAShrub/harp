@@ -7,33 +7,46 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, Paragraph, Widget},
 };
 
-use crate::protocol::ScopeInfo;
+use crate::protocol::{HostInfo, ScopeInfo};
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SwitcherAction {
     None,
     Cancel,
     Attach(u64),
     CreateNew,
+    CreateNewOn(String),
+    AddHost,
 }
 
 pub struct ScopeSwitcher {
     scopes: Vec<ScopeInfo>,
+    hosts: Vec<HostInfo>,
     selected: usize,
     allow_cancel: bool,
 }
 
 impl ScopeSwitcher {
     pub fn new(scopes: Vec<ScopeInfo>, selected: usize, allow_cancel: bool) -> Self {
+        Self::with_hosts(scopes, Vec::new(), selected, allow_cancel)
+    }
+
+    pub fn with_hosts(
+        scopes: Vec<ScopeInfo>,
+        hosts: Vec<HostInfo>,
+        selected: usize,
+        allow_cancel: bool,
+    ) -> Self {
         Self {
             scopes,
+            hosts,
             selected,
             allow_cancel,
         }
     }
 
     fn total_items(&self) -> usize {
-        self.scopes.len() + 1
+        self.scopes.len() + 1 + self.hosts.len() + 1
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> SwitcherAction {
@@ -55,7 +68,14 @@ impl ScopeSwitcher {
                 if let Some(scope) = self.scopes.get(self.selected) {
                     return SwitcherAction::Attach(scope.id);
                 }
-                return SwitcherAction::CreateNew;
+                if self.selected == self.scopes.len() {
+                    return SwitcherAction::CreateNew;
+                }
+                let host_index = self.selected.saturating_sub(self.scopes.len() + 1);
+                if let Some(host) = self.hosts.get(host_index) {
+                    return SwitcherAction::CreateNewOn(host.ssh_host.clone());
+                }
+                return SwitcherAction::AddHost;
             }
             _ => {}
         }
@@ -111,10 +131,15 @@ impl Widget for &ScopeSwitcher {
                     Style::default()
                 };
                 let label = format!(
-                    "{prefix}#{} {} ({} panes) [{}]",
-                    s.id,
+                    "{prefix}#{} {} ({} panes){} [{}]",
+                    s.id & 0x0000_FFFF_FFFF_FFFF,
                     s.name,
                     s.pane_count,
+                    if s.host.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" @{}", s.host)
+                    },
                     s.cwd.display()
                 );
                 ListItem::new(Line::from(Span::styled(label, style)))
@@ -136,12 +161,47 @@ impl Widget for &ScopeSwitcher {
             new_style,
         ))));
 
+        for (index, host) in self.hosts.iter().enumerate() {
+            let item_index = self.scopes.len() + 1 + index;
+            let prefix = if item_index == self.selected {
+                "> "
+            } else {
+                "  "
+            };
+            let style = if item_index == self.selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("{prefix}+ New Scope on {}", host.name),
+                style,
+            ))));
+        }
+        let add_idx = self.total_items() - 1;
+        let add_prefix = if add_idx == self.selected { "> " } else { "  " };
+        let add_style = if add_idx == self.selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("{add_prefix}+ Add SSH Host"),
+            add_style,
+        ))));
+
         List::new(items).render(chunks[0], buf);
 
         let hint = if self.allow_cancel {
-            "Up/Down: select | Enter: switch | Esc: cancel"
+            "Up/Down: select | Enter: open | Add SSH Host at bottom | Esc: cancel"
         } else {
-            "Up/Down: select | Enter: open | Esc: quit"
+            "Up/Down: select | Enter: open | Add SSH Host at bottom | Esc: quit"
         };
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
             .render(chunks[1], buf);
@@ -295,6 +355,7 @@ mod tests {
             name: "harp".to_string(),
             cwd: PathBuf::from("/tmp/harp"),
             pane_count: 2,
+            host: String::new(),
         }];
         let mut switcher = ScopeSwitcher::new(scopes, 0, true);
         assert_eq!(

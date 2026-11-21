@@ -55,6 +55,22 @@ pub struct ScopeInfo {
     pub name: String,
     pub cwd: PathBuf,
     pub pane_count: usize,
+    /// Owning node label. Empty means the node serving this client.
+    #[serde(default)]
+    pub host: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub name: String,
+    pub ssh_host: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AskpassConfig {
+    pub program: PathBuf,
+    pub addr: String,
+    pub token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,7 +133,7 @@ pub struct ScopeSnapshot {
     pub passthrough: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     /// Reports the real terminal's character cell size in pixels so the server
     /// can report pixel sizes through TIOCGWINSZ and answer size queries.
@@ -126,7 +142,25 @@ pub enum ClientMsg {
         cell_h: u16,
     },
     ListScopes,
+    ListHosts,
+    AddHost {
+        ssh_host: String,
+    },
+    ConnectPeer {
+        ssh_host: String,
+        askpass: AskpassConfig,
+    },
+    SyncRemoteScopes {
+        host: String,
+        scopes: Vec<ScopeInfo>,
+    },
     CreateScope {
+        cwd: PathBuf,
+        cols: u16,
+        rows: u16,
+    },
+    CreateScopeOn {
+        host: String,
         cwd: PathBuf,
         cols: u16,
         rows: u16,
@@ -201,6 +235,7 @@ pub enum ClientMsg {
 pub enum ServerMsg {
     Ok,
     Scopes(Vec<ScopeInfo>),
+    Hosts(Vec<HostInfo>),
     Snapshot(ScopeSnapshot),
     Unchanged,
     ScopeClosed,
