@@ -107,7 +107,7 @@ fn benchmark_keystroke_latency_ssh_vs_tunnel() {
             &devbox,
             LinkParams {
                 delay_ms: one_way_ms,
-                up: true,
+                ..Default::default()
             },
         );
         let direct_ms = sample_echo_latencies(&mut direct, "A", one_way_ms, 20);

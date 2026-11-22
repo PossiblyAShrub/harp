@@ -149,11 +149,16 @@ Host $to_name
     var name = parts[1]
     var delay_ms = parts[2]
     var state = parts[3]
+    var rate_kbit = parts[4]
     if (state === 'down') {
       ip link set "veth-$name" down
     } else {
       ip link set "veth-$name" up
-      tc qdisc replace dev "veth-$name" root netem delay "${delay_ms}ms"
+      if (rate_kbit !== '0') {
+        tc qdisc replace dev "veth-$name" root netem delay "${delay_ms}ms" rate "${rate_kbit}kbit"
+      } else {
+        tc qdisc replace dev "veth-$name" root netem delay "${delay_ms}ms"
+      }
     }
     echo "OK"
   } else {

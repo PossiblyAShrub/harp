@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -17,6 +19,7 @@ use tui_term::vt100;
 
 pub struct LinkParams {
     pub delay_ms: u32,
+    pub rate_kbit: Option<u32>,
     pub up: bool,
 }
 
@@ -24,6 +27,7 @@ impl Default for LinkParams {
     fn default() -> Self {
         Self {
             delay_ms: 0,
+            rate_kbit: None,
             up: true,
         }
     }
@@ -162,7 +166,11 @@ impl World {
 
     pub fn set_link(&mut self, machine: &Machine, params: LinkParams) {
         let state = if params.up { "up" } else { "down" };
-        let reply = self.rpc(&format!("LINK {} {} {}", machine.name, params.delay_ms, state));
+        let rate = params.rate_kbit.unwrap_or(0);
+        let reply = self.rpc(&format!(
+            "LINK {} {} {} {}",
+            machine.name, params.delay_ms, state, rate
+        ));
         assert_eq!(reply, "OK", "LINK failed: {reply}");
     }
 

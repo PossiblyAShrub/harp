@@ -1,0 +1,5 @@
+#!/usr/bin/env ysh
+# Run the namespace-based SSH latency benchmark suite.
+# Requires unprivileged user+net namespaces (outside restricted sandboxes).
+
+cargo test --release --test ssh_bench -- --ignored --nocapture --test-threads=1 @ARGV
