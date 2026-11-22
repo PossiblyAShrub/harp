@@ -402,13 +402,17 @@ impl App {
                 self.status.set_error(None);
                 // Forward escape sequences the server couldn't render (kitty
                 // graphics protocol) to the real terminal for display.
+                let scope_id = snap.scope_id;
+                let revision = snap.revision;
                 if !snap.passthrough.is_empty() {
                     let mut stdout = io::stdout().lock();
                     let _ = stdout.write_all(snap.passthrough.as_bytes());
                     let _ = stdout.flush();
                 }
                 self.apply_snapshot(snap);
+                self.client.subscribe(scope_id, revision)?;
             }
+            ServerMsg::PushSnapshot(_) | ServerMsg::PushScopeClosed(_) => {}
             ServerMsg::Unchanged => {}
             ServerMsg::Ok => {}
             ServerMsg::ScopeClosed => {
@@ -764,7 +768,62 @@ impl App {
         true
     }
 
+    fn handle_pushed_server_msg(&mut self, msg: ServerMsg) -> io::Result<()> {
+        match msg {
+            ServerMsg::PushSnapshot(snap) => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|cur| cur.scope_id == snap.scope_id)
+                {
+                    if !snap.passthrough.is_empty() {
+                        let mut stdout = io::stdout().lock();
+                        let _ = stdout.write_all(snap.passthrough.as_bytes());
+                        let _ = stdout.flush();
+                    }
+                    self.apply_snapshot(snap);
+                }
+            }
+            ServerMsg::PushScopeClosed(scope_id) => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|cur| cur.scope_id == scope_id)
+                {
+                    self.handle_server_reply(ServerMsg::ScopeClosed)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        enum UiEvent {
+            Term(Event),
+            Server(ServerMsg),
+        }
+
+        let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
+        let push_tx = ui_tx.clone();
+        self.client
+            .set_push_callback(std::sync::Arc::new(move |msg| {
+                let _ = push_tx.send(UiEvent::Server(msg));
+            }));
+
+        if let Some(snap) = &self.snapshot {
+            self.client.subscribe(snap.scope_id, snap.revision)?;
+        }
+
+        let term_tx = ui_tx;
+        thread::spawn(move || {
+            while let Ok(ev) = event::read() {
+                if term_tx.send(UiEvent::Term(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
         while !self.exit {
             self.process_background()?;
             self.flush_expired_q()?;
@@ -773,17 +832,38 @@ impl App {
             }
             terminal.draw(|frame| self.render(frame))?;
 
-            if event::poll(Duration::from_millis(16))? {
-                self.handle_events()?;
-            } else if !self.exit
-                && let Some(snap) = &self.snapshot
+            let wait = if self.pending_q.is_some()
+                || !self.connecting_hosts.is_empty()
+                || self.askpass_prompt.is_some()
             {
-                self.client.send(&ClientMsg::Poll {
-                    scope_id: snap.scope_id,
-                    last_revision: snap.revision,
-                })?;
-                let reply = self.client.recv::<ServerMsg>()?;
-                self.handle_server_reply(reply)?;
+                Duration::from_millis(25)
+            } else {
+                Duration::from_millis(250)
+            };
+
+            match ui_rx.recv_timeout(wait) {
+                Ok(first) => {
+                    let mut term_events = Vec::new();
+                    let mut server_pushes = Vec::new();
+                    match first {
+                        UiEvent::Term(ev) => term_events.push(ev),
+                        UiEvent::Server(msg) => server_pushes.push(msg),
+                    }
+                    while let Ok(ev) = ui_rx.try_recv() {
+                        match ev {
+                            UiEvent::Term(t) => term_events.push(t),
+                            UiEvent::Server(m) => server_pushes.push(m),
+                        }
+                    }
+                    for msg in server_pushes {
+                        self.handle_pushed_server_msg(msg)?;
+                    }
+                    if !term_events.is_empty() {
+                        self.handle_events(term_events)?;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
 
@@ -880,9 +960,8 @@ impl App {
         frame.render_widget(self, frame.area());
     }
 
-    fn handle_events(&mut self) -> io::Result<()> {
-        loop {
-            let event = event::read()?;
+    fn handle_events(&mut self, events: Vec<Event>) -> io::Result<()> {
+        for event in events {
             if matches!(event, Event::Resize(..) | Event::Paste(_))
                 || matches!(event, Event::Key(KeyEvent { kind: KeyEventKind::Press, code, .. })
                     if !matches!(code, KeyCode::Modifier(_)))
@@ -934,7 +1013,7 @@ impl App {
                     && !self.askpass_visible
                     && self.handle_q_gesture(&event)?)
             {
-                if self.exit || !event::poll(Duration::ZERO)? {
+                if self.exit {
                     break;
                 }
                 continue;
@@ -1391,7 +1470,7 @@ impl App {
                 }
             }
 
-            if self.exit || !event::poll(Duration::ZERO)? {
+            if self.exit {
                 break;
             }
         }

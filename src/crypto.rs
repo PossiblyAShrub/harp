@@ -17,7 +17,62 @@ pub struct EncryptedStream {
     is_client: bool,
 }
 
+pub struct EncryptedReader {
+    stream: TcpStream,
+    cipher: ChaCha20Poly1305,
+    recv_counter: u64,
+    is_client: bool,
+}
+
+pub struct EncryptedWriter {
+    stream: TcpStream,
+    cipher: ChaCha20Poly1305,
+    send_counter: u64,
+    is_client: bool,
+}
+
+impl EncryptedReader {
+    pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
+        read_frame(
+            &mut self.stream,
+            &self.cipher,
+            &mut self.recv_counter,
+            self.is_client,
+        )
+    }
+}
+
+impl EncryptedWriter {
+    pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
+        write_frame(
+            &mut self.stream,
+            &self.cipher,
+            &mut self.send_counter,
+            self.is_client,
+            msg,
+        )
+    }
+}
+
 impl EncryptedStream {
+    pub fn split(self) -> io::Result<(EncryptedReader, EncryptedWriter)> {
+        let reader_stream = self.stream.try_clone()?;
+        Ok((
+            EncryptedReader {
+                stream: reader_stream,
+                cipher: self.cipher.clone(),
+                recv_counter: self.recv_counter,
+                is_client: self.is_client,
+            },
+            EncryptedWriter {
+                stream: self.stream,
+                cipher: self.cipher,
+                send_counter: self.send_counter,
+                is_client: self.is_client,
+            },
+        ))
+    }
+
     pub fn handshake_client(stream: TcpStream) -> io::Result<Self> {
         Self::handshake(stream, true)
     }
@@ -59,60 +114,88 @@ impl EncryptedStream {
         })
     }
 
+    #[cfg(test)]
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
-        let plaintext = serde_json::to_vec(msg).map_err(io::Error::other)?;
-        let nonce_bytes = make_nonce(self.is_client, self.send_counter);
-        self.send_counter = self
-            .send_counter
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
-
-        let ciphertext = self
-            .cipher
-            .encrypt(&Nonce::from(nonce_bytes), plaintext.as_slice())
-            .map_err(|e| io::Error::other(format!("encrypt error: {e}")))?;
-
-        let len: u32 = ciphertext
-            .len()
-            .try_into()
-            .map_err(|_| io::Error::other("frame too large"))?;
-        let mut frame = Vec::with_capacity(4 + ciphertext.len());
-        frame.extend_from_slice(&len.to_be_bytes());
-        frame.extend_from_slice(&ciphertext);
-        self.stream.write_all(&frame)?;
-        self.stream.flush()
+        write_frame(
+            &mut self.stream,
+            &self.cipher,
+            &mut self.send_counter,
+            self.is_client,
+            msg,
+        )
     }
 
+    #[cfg(test)]
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame exceeds maximum size",
-            ));
-        }
-
-        let mut ciphertext = vec![0u8; len];
-        self.stream.read_exact(&mut ciphertext)?;
-
-        let nonce_bytes = make_nonce(!self.is_client, self.recv_counter);
-        self.recv_counter = self
-            .recv_counter
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
-
-        let plaintext = self
-            .cipher
-            .decrypt(&Nonce::from(nonce_bytes), ciphertext.as_slice())
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}"))
-            })?;
-
-        serde_json::from_slice(&plaintext)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode error: {e}")))
+        read_frame(
+            &mut self.stream,
+            &self.cipher,
+            &mut self.recv_counter,
+            self.is_client,
+        )
     }
+}
+
+fn write_frame<T: Serialize>(
+    stream: &mut TcpStream,
+    cipher: &ChaCha20Poly1305,
+    send_counter: &mut u64,
+    is_client: bool,
+    msg: &T,
+) -> io::Result<()> {
+    let plaintext = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    let nonce_bytes = make_nonce(is_client, *send_counter);
+    *send_counter = send_counter
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
+
+    let ciphertext = cipher
+        .encrypt(&Nonce::from(nonce_bytes), plaintext.as_slice())
+        .map_err(|e| io::Error::other(format!("encrypt error: {e}")))?;
+
+    let len: u32 = ciphertext
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::other("frame too large"))?;
+    let mut frame = Vec::with_capacity(4 + ciphertext.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&ciphertext);
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+fn read_frame<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    cipher: &ChaCha20Poly1305,
+    recv_counter: &mut u64,
+    is_client: bool,
+) -> io::Result<T> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds maximum size",
+        ));
+    }
+
+    let mut ciphertext = vec![0u8; len];
+    stream.read_exact(&mut ciphertext)?;
+
+    let nonce_bytes = make_nonce(!is_client, *recv_counter);
+    *recv_counter = recv_counter
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("nonce counter overflow"))?;
+
+    let plaintext = cipher
+        .decrypt(&Nonce::from(nonce_bytes), ciphertext.as_slice())
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}"))
+        })?;
+
+    serde_json::from_slice(&plaintext)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode error: {e}")))
 }
 
 fn make_nonce(from_client: bool, counter: u64) -> [u8; 12] {

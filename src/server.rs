@@ -21,7 +21,8 @@ use anyhow::Result;
 use ratatui::layout::{Direction, Rect};
 
 use crate::{
-    crypto::EncryptedStream,
+    crypto::{EncryptedStream, EncryptedWriter},
+    projections,
     protocol::{ClientMsg, HostInfo, NavDir, ScopeInfo, ServerMsg},
     scopes::{NavDirection, Scope, ScopeSpec},
 };
@@ -154,7 +155,10 @@ pub fn run_askpass_helper(config: &AskpassConfig, prompt: &str) -> Result<()> {
 /// Keeping the child here makes the forwarding process live exactly as long as
 /// the client session.
 pub struct ClientConnection {
-    stream: EncryptedStream,
+    writer: EncryptedWriter,
+    rpc_rx: Receiver<io::Result<ServerMsg>>,
+    push_cb: Arc<Mutex<Option<(u64, Arc<dyn Fn(ServerMsg) + Send + Sync>)>>>,
+    push_cb_root: Option<Arc<dyn Fn(ServerMsg) + Send + Sync>>,
     peers: Vec<(HostInfo, Box<ClientConnection>)>,
     pending_peer: Option<usize>,
     aggregating_scopes: bool,
@@ -173,6 +177,87 @@ pub struct ServerTraceEntry {
 }
 
 impl ClientConnection {
+    fn from_stream(
+        stream: EncryptedStream,
+        tunnel: Option<Child>,
+        ssh_control_dir: Option<PathBuf>,
+    ) -> io::Result<Self> {
+        let (mut reader, writer) = stream.split()?;
+        let (rpc_tx, rpc_rx) = mpsc::channel();
+        let push_cb: Arc<Mutex<Option<(u64, Arc<dyn Fn(ServerMsg) + Send + Sync>)>>> =
+            Arc::new(Mutex::new(None));
+        let push_cb_bg = Arc::clone(&push_cb);
+
+        thread::spawn(move || {
+            loop {
+                match reader.recv::<ServerMsg>() {
+                    Ok(ServerMsg::PushSnapshot(mut snap)) => {
+                        if let Some((tag, cb)) = push_cb_bg.lock().unwrap().as_ref() {
+                            if *tag > 0 {
+                                snap.scope_id =
+                                    (*tag << 48) | (snap.scope_id & 0x0000_FFFF_FFFF_FFFF);
+                            }
+                            cb(ServerMsg::PushSnapshot(snap));
+                        }
+                    }
+                    Ok(ServerMsg::PushScopeClosed(mut id)) => {
+                        if let Some((tag, cb)) = push_cb_bg.lock().unwrap().as_ref() {
+                            if *tag > 0 {
+                                id = (*tag << 48) | (id & 0x0000_FFFF_FFFF_FFFF);
+                            }
+                            cb(ServerMsg::PushScopeClosed(id));
+                        }
+                    }
+                    Ok(msg) => {
+                        if rpc_tx.send(Ok(msg)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = rpc_tx.send(Err(err));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            writer,
+            rpc_rx,
+            push_cb,
+            push_cb_root: None,
+            peers: Vec::new(),
+            pending_peer: None,
+            aggregating_scopes: false,
+            cell_px: None,
+            _tunnel: tunnel,
+            _ssh_control_dir: ssh_control_dir,
+            pending: VecDeque::new(),
+            trace: VecDeque::new(),
+        })
+    }
+
+    pub fn set_push_callback(&mut self, cb: Arc<dyn Fn(ServerMsg) + Send + Sync>) {
+        self.push_cb_root = Some(Arc::clone(&cb));
+        *self.push_cb.lock().unwrap() = Some((0, Arc::clone(&cb)));
+        for (index, (_, peer)) in self.peers.iter().enumerate() {
+            *peer.push_cb.lock().unwrap() = Some(((index + 1) as u64, Arc::clone(&cb)));
+        }
+    }
+
+    pub fn subscribe(&mut self, scope_id: u64, last_revision: u64) -> io::Result<()> {
+        self.send(&ClientMsg::Subscribe {
+            scope_id,
+            last_revision,
+        })
+    }
+
+    fn recv_rpc(&mut self) -> io::Result<ServerMsg> {
+        self.rpc_rx.recv().map_err(|_| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "server connection closed")
+        })?
+    }
+
     pub fn send(&mut self, value: &ClientMsg) -> std::io::Result<()> {
         let label = message_label(value);
         if let ClientMsg::SetPixelSize { cell_w, cell_h } = value {
@@ -181,7 +266,7 @@ impl ClientConnection {
         self.pending_peer = None;
         self.aggregating_scopes = matches!(value, ClientMsg::ListScopes);
         if self.aggregating_scopes {
-            self.stream.send(value)?;
+            self.writer.send(value)?;
             for (_, peer) in &mut self.peers {
                 peer.send(value)?;
             }
@@ -231,8 +316,8 @@ impl ClientConnection {
             }
         }
 
-        self.stream.send(value)?;
-        if label != "InputAsync" {
+        self.writer.send(value)?;
+        if !matches!(label.as_str(), "InputAsync" | "Subscribe") {
             self.pending.push_back((label, Instant::now()));
         }
         Ok(())
@@ -243,22 +328,23 @@ impl ClientConnection {
     ) -> std::io::Result<T> {
         if self.aggregating_scopes {
             self.aggregating_scopes = false;
-            let mut scopes: Vec<ScopeInfo> = self.stream.recv::<ServerMsg>()?.into_scopes()?;
-            for (index, (host, peer)) in self.peers.iter_mut().enumerate() {
-                let mut remote: Vec<ScopeInfo> = peer.recv::<ServerMsg>()?.into_scopes()?;
+            let mut scopes: Vec<ScopeInfo> = self.recv_rpc()?.into_scopes()?;
+            for index in 0..self.peers.len() {
+                let host_name = self.peers[index].0.name.clone();
+                let mut remote: Vec<ScopeInfo> = self.peers[index].1.recv::<ServerMsg>()?.into_scopes()?;
                 let catalog = remote.clone();
-                self.stream.send(&ClientMsg::SyncRemoteScopes {
-                    host: host.name.clone(),
+                self.writer.send(&ClientMsg::SyncRemoteScopes {
+                    host: host_name.clone(),
                     scopes: catalog,
                 })?;
-                match self.stream.recv::<ServerMsg>()? {
+                match self.recv_rpc()? {
                     ServerMsg::Ok => {}
                     ServerMsg::Error(error) => return Err(io::Error::other(error)),
                     _ => return Err(io::Error::other("invalid remote scope catalog response")),
                 }
                 for scope in &mut remote {
                     scope.id = (((index + 1) as u64) << 48) | (scope.id & 0x0000_FFFF_FFFF_FFFF);
-                    scope.host = host.name.clone();
+                    scope.host = host_name.clone();
                 }
                 scopes.extend(remote);
             }
@@ -267,22 +353,19 @@ impl ClientConnection {
                 .map_err(io::Error::other);
         }
         let route = self.pending_peer.take();
-        let mut wire: serde_json::Value = match route {
-            Some(index) => self.peers[index].1.recv()?,
-            None => self.stream.recv()?,
+        let mut msg = match route {
+            Some(index) => self.peers[index].1.recv_rpc()?,
+            None => self.recv_rpc()?,
         };
-        if let Some(index) = route {
-            if let Ok(ServerMsg::Snapshot(mut snapshot)) =
-                serde_json::from_value::<ServerMsg>(wire.clone())
-            {
-                snapshot.scope_id =
-                    (((index + 1) as u64) << 48) | (snapshot.scope_id & 0x0000_FFFF_FFFF_FFFF);
-                wire = serde_json::to_value(ServerMsg::Snapshot(snapshot))
-                    .map_err(io::Error::other)?;
-            }
+        if let Some(index) = route
+            && let ServerMsg::Snapshot(ref mut snapshot) = msg
+        {
+            snapshot.scope_id =
+                (((index + 1) as u64) << 48) | (snapshot.scope_id & 0x0000_FFFF_FFFF_FFFF);
         }
-        let value: T = serde_json::from_value(wire).map_err(io::Error::other)?;
-        let response = message_label(&value);
+        let response = message_label(&msg);
+        let value: T = serde_json::from_value(serde_json::to_value(msg).map_err(io::Error::other)?)
+            .map_err(io::Error::other)?;
         if let Some((request, started)) = self.pending.pop_front() {
             self.trace.push_back(ServerTraceEntry {
                 request,
@@ -315,6 +398,10 @@ impl ClientConnection {
         if let Some((cell_w, cell_h)) = self.cell_px {
             connection.send(&ClientMsg::SetPixelSize { cell_w, cell_h })?;
             let _ = connection.recv::<ServerMsg>()?;
+        }
+        if let Some(cb) = &self.push_cb_root {
+            let tag = (self.peers.len() + 1) as u64;
+            *connection.push_cb.lock().unwrap() = Some((tag, Arc::clone(cb)));
         }
         self.peers.push((host, Box::new(connection)));
         Ok(())
@@ -360,6 +447,7 @@ fn client_scope_id(msg: &ClientMsg) -> Option<u64> {
         | ClientMsg::Resize { scope_id, .. }
         | ClientMsg::Input { scope_id, .. }
         | ClientMsg::InputAsync { scope_id, .. }
+        | ClientMsg::Subscribe { scope_id, .. }
         | ClientMsg::CloseProjection { scope_id, .. }
         | ClientMsg::MoveFocus { scope_id, .. }
         | ClientMsg::DropProjection { scope_id, .. }
@@ -380,6 +468,7 @@ fn rewrite_scope_id(mut msg: ClientMsg, id: u64) -> ClientMsg {
         | ClientMsg::Resize { scope_id, .. }
         | ClientMsg::Input { scope_id, .. }
         | ClientMsg::InputAsync { scope_id, .. }
+        | ClientMsg::Subscribe { scope_id, .. }
         | ClientMsg::CloseProjection { scope_id, .. }
         | ClientMsg::MoveFocus { scope_id, .. }
         | ClientMsg::DropProjection { scope_id, .. }
@@ -696,6 +785,10 @@ impl ServerState {
                     None => ServerMsg::ScopeClosed,
                 }
             }
+            ClientMsg::Subscribe { .. } => {
+                // Subscribe is handled in the client thread before handle_msg.
+                ServerMsg::Ok
+            }
             ClientMsg::Input { scope_id, event } | ClientMsg::InputAsync { scope_id, event } => {
                 let Some(entry) = self.find_mut(scope_id) else {
                     return ServerMsg::ScopeClosed;
@@ -868,15 +961,76 @@ pub fn run_server(bind_addr: &str) -> Result<()> {
                 let _ = stream.set_nonblocking(false);
                 let state = Arc::clone(&state);
                 thread::spawn(move || {
-                    let Ok(mut encrypted) = EncryptedStream::handshake_server(stream) else {
+                    let Ok(encrypted) = EncryptedStream::handshake_server(stream) else {
                         return;
                     };
-                    while let Ok(msg) = encrypted.recv::<ClientMsg>() {
+                    let Ok((mut reader, writer)) = encrypted.split() else {
+                        return;
+                    };
+                    let writer = Arc::new(Mutex::new(writer));
+                    let subscription: Arc<Mutex<Option<(u64, u64)>>> = Arc::new(Mutex::new(None));
+                    let done = Arc::new(AtomicBool::new(false));
+
+                    let state_push = Arc::clone(&state);
+                    let writer_push = Arc::clone(&writer);
+                    let sub_push = Arc::clone(&subscription);
+                    let done_push = Arc::clone(&done);
+                    let push_handle = thread::spawn(move || {
+                        let mut seen_seq = projections::watcher_seq();
+                        while !done_push.load(Ordering::Acquire) {
+                            let sub = *sub_push.lock().unwrap();
+                            let to_send = if let Some((scope_id, last_rev)) = sub {
+                                let mut guard = state_push.lock().unwrap();
+                                guard.prune_all();
+                                match guard.find_mut(scope_id) {
+                                    None => Some((None, ServerMsg::PushScopeClosed(scope_id))),
+                                    Some(entry) if entry.scope.revision() != last_rev => {
+                                        let rev = entry.scope.revision();
+                                        let name = entry.name.clone();
+                                        match entry.scope.snapshot(scope_id, name) {
+                                            Some(snap) => Some((
+                                                Some((scope_id, rev)),
+                                                ServerMsg::PushSnapshot(snap),
+                                            )),
+                                            None => {
+                                                Some((None, ServerMsg::PushScopeClosed(scope_id)))
+                                            }
+                                        }
+                                    }
+                                    Some(_) => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some((next_sub, msg)) = to_send {
+                                *sub_push.lock().unwrap() = next_sub;
+                                if writer_push.lock().unwrap().send(&msg).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            seen_seq =
+                                projections::wait_watchers(seen_seq, Duration::from_millis(250));
+                        }
+                    });
+
+                    while let Ok(msg) = reader.recv::<ClientMsg>() {
                         if let ClientMsg::ConnectPeer { ssh_host, askpass } = msg {
                             let reply = ensure_peer_master(&state, &ssh_host, &askpass);
-                            if encrypted.send(&reply).is_err() {
+                            if writer.lock().unwrap().send(&reply).is_err() {
                                 break;
                             }
+                            continue;
+                        }
+                        if let ClientMsg::Subscribe {
+                            scope_id,
+                            last_revision,
+                        } = msg
+                        {
+                            *subscription.lock().unwrap() = Some((scope_id, last_revision));
+                            projections::wake_watchers();
                             continue;
                         }
                         let reply_expected = !matches!(&msg, ClientMsg::InputAsync { .. });
@@ -886,10 +1040,19 @@ pub fn run_server(bind_addr: &str) -> Result<()> {
                             let exit_after = guard.should_exit();
                             (reply, exit_after)
                         };
-                        if (reply_expected && encrypted.send(&reply).is_err()) || exit_after {
+                        if !reply_expected {
+                            projections::wake_watchers();
+                        }
+                        if (reply_expected && writer.lock().unwrap().send(&reply).is_err())
+                            || exit_after
+                        {
                             break;
                         }
                     }
+
+                    done.store(true, Ordering::Release);
+                    projections::wake_watchers();
+                    let _ = push_handle.join();
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -955,51 +1118,33 @@ fn ensure_peer_master(
 
 pub fn connect_or_spawn(addr: &str) -> Result<ClientConnection> {
     if let Ok(stream) = TcpStream::connect(addr) {
-        return Ok(ClientConnection {
-            stream: EncryptedStream::handshake_client(stream)?,
-            peers: Vec::new(),
-            pending_peer: None,
-            aggregating_scopes: false,
-            cell_px: None,
-            _tunnel: None,
-            _ssh_control_dir: None,
-            pending: VecDeque::new(),
-            trace: VecDeque::new(),
-        });
+        return Ok(ClientConnection::from_stream(
+            EncryptedStream::handshake_client(stream)?,
+            None,
+            None,
+        )?);
     }
 
     if is_local_addr(addr) {
         spawn_background_server(addr)?;
         for _ in 0..40 {
             if let Ok(stream) = TcpStream::connect(addr) {
-                return Ok(ClientConnection {
-                    stream: EncryptedStream::handshake_client(stream)?,
-                    peers: Vec::new(),
-                    pending_peer: None,
-                    aggregating_scopes: false,
-                    cell_px: None,
-                    _tunnel: None,
-                    _ssh_control_dir: None,
-                    pending: VecDeque::new(),
-                    trace: VecDeque::new(),
-                });
+                return Ok(ClientConnection::from_stream(
+                    EncryptedStream::handshake_client(stream)?,
+                    None,
+                    None,
+                )?);
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
     let stream = TcpStream::connect(addr)?;
-    Ok(ClientConnection {
-        stream: EncryptedStream::handshake_client(stream)?,
-        peers: Vec::new(),
-        pending_peer: None,
-        aggregating_scopes: false,
-        cell_px: None,
-        _tunnel: None,
-        _ssh_control_dir: None,
-        pending: VecDeque::new(),
-        trace: VecDeque::new(),
-    })
+    Ok(ClientConnection::from_stream(
+        EncryptedStream::handshake_client(stream)?,
+        None,
+        None,
+    )?)
 }
 
 /// Ask the local Harp server to own the SSH master, then open a short-lived
@@ -1051,17 +1196,11 @@ fn connect_ssh_tunnel(host: &str) -> Result<ClientConnection> {
         if let Ok(stream) = TcpStream::connect(&addr)
             && let Ok(stream) = EncryptedStream::handshake_client(stream)
         {
-            return Ok(ClientConnection {
+            return Ok(ClientConnection::from_stream(
                 stream,
-                peers: Vec::new(),
-                pending_peer: None,
-                aggregating_scopes: false,
-                cell_px: None,
-                _tunnel: Some(tunnel),
-                _ssh_control_dir: control_path.parent().map(PathBuf::from),
-                pending: VecDeque::new(),
-                trace: VecDeque::new(),
-            });
+                Some(tunnel),
+                control_path.parent().map(PathBuf::from),
+            )?);
         }
         if let Some(status) = tunnel.try_wait()? {
             anyhow::bail!("SSH tunnel exited before connecting ({status})");

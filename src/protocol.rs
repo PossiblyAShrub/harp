@@ -193,6 +193,12 @@ pub enum ClientMsg {
         scope_id: u64,
         event: Event,
     },
+    /// Opts this connection into server-pushed snapshots for `scope_id`
+    /// whenever its revision advances past `last_revision`. No reply.
+    Subscribe {
+        scope_id: u64,
+        last_revision: u64,
+    },
     CloseProjection {
         scope_id: u64,
         projection_id: usize,
@@ -237,6 +243,8 @@ pub enum ServerMsg {
     Scopes(Vec<ScopeInfo>),
     Hosts(Vec<HostInfo>),
     Snapshot(ScopeSnapshot),
+    PushSnapshot(ScopeSnapshot),
+    PushScopeClosed(u64),
     Unchanged,
     ScopeClosed,
     Error(String),

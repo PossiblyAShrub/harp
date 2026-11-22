@@ -3,14 +3,39 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    time::Duration,
 };
 
-#[cfg(test)]
-use std::time::Duration;
+static WATCHERS: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+
+fn watchers() -> &'static (Mutex<u64>, Condvar) {
+    WATCHERS.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+pub fn wake_watchers() {
+    let (lock, cvar) = watchers();
+    let mut seq = lock.lock().unwrap();
+    *seq = seq.wrapping_add(1);
+    cvar.notify_all();
+}
+
+pub fn watcher_seq() -> u64 {
+    *watchers().0.lock().unwrap()
+}
+
+pub fn wait_watchers(last_seq: u64, timeout: Duration) -> u64 {
+    let (lock, cvar) = watchers();
+    let seq = lock.lock().unwrap();
+    if *seq != last_seq {
+        return *seq;
+    }
+    let (guard, _) = cvar.wait_timeout(seq, timeout).unwrap();
+    *guard
+}
 
 use anyhow::Result;
 use crossterm::event::{
@@ -248,11 +273,13 @@ impl ProjectionTerm {
                         .extend_from_slice(&passthrough);
                 }
                 revision_clone.fetch_add(1, Ordering::Release);
+                wake_watchers();
             }
 
             let _ = child.wait();
             exited_clone.store(true, Ordering::Release);
             revision_clone.fetch_add(1, Ordering::Release);
+            wake_watchers();
         });
 
         Ok(Self {
