@@ -1,0 +1,162 @@
+#!/usr/bin/env ysh
+# PID 1 inside the test World's user+net+mount+pid namespace.
+# Reads line commands on stdin and replies on stdout; exits on EOF.
+
+var lab_dir = $1
+var harp_bin = $2
+
+# Basic world network: loopback + bridge br0 (10.0.0.1/24)
+ip link set lo up
+ip link add br0 type bridge
+ip addr add 10.0.0.1/24 dev br0
+ip link set br0 up
+
+# Make OpenSSH sshd & ssh happy inside a rootless user namespace:
+# host-owned /usr/share/empty.sshd, /etc/ssh/ssh_config, /etc/shadow, /root
+# appear owned by unmapped nobody unless replaced in our mount namespace.
+mount -t tmpfs tmpfs /usr/share/empty.sshd
+chmod 755 /usr/share/empty.sshd
+
+echo "" > $lab_dir/empty_ssh_config
+mount --bind $lab_dir/empty_ssh_config /etc/ssh/ssh_config
+
+echo "root::19000:0:99999:7:::" > $lab_dir/shadow
+chmod 600 $lab_dir/shadow
+mount --bind $lab_dir/shadow /etc/shadow
+
+mount -t tmpfs tmpfs /root
+chmod 700 /root
+
+# Shared SSH keys for all machines in this world
+mkdir -p $lab_dir/ssh
+ssh-keygen -t ed25519 -N "" -f $lab_dir/ssh/host_key >/dev/null
+ssh-keygen -t ed25519 -N "" -f $lab_dir/ssh/user_key >/dev/null
+cp $lab_dir/ssh/user_key.pub $lab_dir/ssh/authorized_keys
+chmod 600 $lab_dir/ssh/authorized_keys $lab_dir/ssh/host_key $lab_dir/ssh/user_key
+
+echo "READY"
+
+while read line {
+  if (line === '') {
+    continue
+  }
+  var parts = line.split(' ')
+  var cmd = parts[0]
+
+  if (cmd === 'ADD') {
+    var name = parts[1]
+    var octet = parts[2]
+    var has_harp = parts[3]
+    var mdir = "$lab_dir/machines/$name"
+    mkdir -p $mdir/home/.ssh $mdir/run $mdir/bin
+    chmod 700 $mdir/home $mdir/home/.ssh $mdir/run
+
+    if (has_harp === '1') {
+      ln -sf $harp_bin $mdir/bin/harp
+    }
+
+    cp $lab_dir/ssh/user_key $mdir/home/.ssh/id_ed25519
+    chmod 600 $mdir/home/.ssh/id_ed25519
+
+    echo "
+Port 22
+ListenAddress 10.0.0.$octet
+HostKey $lab_dir/ssh/host_key
+AuthorizedKeysFile $lab_dir/ssh/authorized_keys
+PermitRootLogin yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+PidFile $mdir/sshd.pid
+" > $mdir/sshd_config
+
+    echo "
+Host *
+    User root
+    IdentityFile $mdir/home/.ssh/id_ed25519
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+" > $mdir/home/.ssh/config
+    chmod 600 $mdir/home/.ssh/config
+
+    # Start the machine's own net+uts+mount+pid namespace.
+    # Its PID 1 is `sleep infinity`, keeping the namespaces alive until killed.
+    fork {
+      exec unshare --net --uts --mount --pid --fork --kill-child --mount-proc ysh -c "
+        ip link set lo up
+        /usr/bin/hostname $name
+        mount --bind $mdir/home /root
+        if (\"$has_harp\" === '1') {
+          mount -t tmpfs tmpfs /usr/local/bin
+          ln -s $harp_bin /usr/local/bin/harp
+        }
+        mount -t devpts devpts /dev/pts -o newinstance,ptmxmode=0666
+        mount --bind /dev/pts/ptmx /dev/ptmx
+        echo READY > $mdir/ns_ready
+        exec sleep infinity
+      "
+    }
+    var u_pid = $!
+    while test ! -s $mdir/ns_ready {
+      sleep 0.01
+    }
+    var m_pid = $(cat /proc/$u_pid/task/$u_pid/children).trim()
+
+    # Wire veth-<name> on br0 <-> eth0 inside the machine's netns
+    ip link add "veth-$name" type veth peer name eth0 netns $m_pid
+    ip link set "veth-$name" master br0 up
+    tc qdisc add dev "veth-$name" root netem delay 0ms
+
+    nsenter --net --uts --mount --pid -t $m_pid -- sh -c "
+      ip addr add 10.0.0.$octet/24 dev eth0
+      ip link set eth0 up
+      ip route add default via 10.0.0.1
+    "
+
+    # Start sshd inside the machine's namespaces
+    nsenter --net --uts --mount --pid -t $m_pid -- env -i \
+      HOME=$mdir/home \
+      PATH="$mdir/bin:/usr/local/bin:/usr/bin:/bin" \
+      /usr/sbin/sshd -f $mdir/sshd_config -o LogLevel=ERROR -E $mdir/sshd.log
+
+    # Wait until sshd is listening on 10.0.0.$octet:22
+    while true {
+      try {
+        nsenter --net --uts --mount --pid -t $m_pid -- \
+          ssh -F $mdir/home/.ssh/config -o ConnectTimeout=1 "10.0.0.$octet" true >/dev/null 2>&1
+      }
+      if (_error.code === 0) {
+        break
+      }
+      sleep 0.02
+    }
+
+    echo "OK $m_pid"
+  } elif (cmd === 'PEER') {
+    # Register a host alias in <from>'s ~/.ssh/config pointing at <to>'s IP
+    var from_name = parts[1]
+    var to_name = parts[2]
+    var to_octet = parts[3]
+    var cfg = "$lab_dir/machines/$from_name/home/.ssh/config"
+    echo "
+Host $to_name
+    HostName 10.0.0.$to_octet
+" >> $cfg
+    echo "OK"
+  } elif (cmd === 'LINK') {
+    var name = parts[1]
+    var delay_ms = parts[2]
+    var state = parts[3]
+    if (state === 'down') {
+      ip link set "veth-$name" down
+    } else {
+      ip link set "veth-$name" up
+      tc qdisc replace dev "veth-$name" root netem delay "${delay_ms}ms"
+    }
+    echo "OK"
+  } else {
+    echo "ERR unknown command: $cmd"
+  }
+}

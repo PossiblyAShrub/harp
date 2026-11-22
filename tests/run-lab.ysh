@@ -1,0 +1,5 @@
+#!/usr/bin/env ysh
+# Run the namespace-based multi-machine SSH test suite.
+# Requires unprivileged user+net namespaces (outside restricted sandboxes).
+
+cargo test --test ssh_lab -- --ignored --nocapture --test-threads=1 @ARGV
