@@ -1444,15 +1444,13 @@ impl App {
                                 }
                             }
                         }
-                        Event::Mouse(mouse_event) => {
+                        Event::Mouse(mouse_event)
                             if matches!(
                                 mouse_event.kind,
                                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                            ) {
-                                self.handle_wheel(*mouse_event)?;
-                            } else {
-                                self.forward_event(event)?;
-                            }
+                            ) =>
+                        {
+                            self.handle_wheel(*mouse_event)?;
                         }
                         _ => {}
                     },
