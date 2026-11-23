@@ -14,6 +14,7 @@ pub enum SwitcherAction {
     None,
     Cancel,
     Attach(u64),
+    Rename(u64, String),
     CreateNew,
     CreateNewOn(String),
     AddHost,
@@ -49,6 +50,12 @@ impl ScopeSwitcher {
         self.scopes.len() + 1 + self.hosts.len() + 1
     }
 
+    pub fn update_scope_name(&mut self, scope_id: u64, name: String) {
+        if let Some(scope) = self.scopes.iter_mut().find(|s| s.id == scope_id) {
+            scope.name = name;
+        }
+    }
+
     pub fn handle_key(&mut self, key_event: KeyEvent) -> SwitcherAction {
         if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return SwitcherAction::None;
@@ -62,6 +69,11 @@ impl ScopeSwitcher {
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.total_items() {
                     self.selected += 1;
+                }
+            }
+            KeyCode::Char('r') if key_event.modifiers == KeyModifiers::NONE => {
+                if let Some(scope) = self.scopes.get(self.selected) {
+                    return SwitcherAction::Rename(scope.id, scope.name.clone());
                 }
             }
             KeyCode::Enter => {
@@ -199,9 +211,9 @@ impl Widget for &ScopeSwitcher {
         List::new(items).render(chunks[0], buf);
 
         let hint = if self.allow_cancel {
-            "Up/Down: select | Enter: open | Add SSH Host at bottom | Esc: cancel"
+            "Up/Down: select | Enter: open | r: rename | Esc: cancel"
         } else {
-            "Up/Down: select | Enter: open | Add SSH Host at bottom | Esc: quit"
+            "Up/Down: select | Enter: open | r: rename | Esc: quit"
         };
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
             .render(chunks[1], buf);
@@ -359,13 +371,27 @@ mod tests {
         }];
         let mut switcher = ScopeSwitcher::new(scopes, 0, true);
         assert_eq!(
+            switcher.handle_key(key(KeyCode::Char('r'))),
+            SwitcherAction::Rename(7, "harp".to_string())
+        );
+        assert_eq!(
             switcher.handle_key(key(KeyCode::Enter)),
             SwitcherAction::Attach(7)
         );
         switcher.handle_key(key(KeyCode::Down));
         assert_eq!(
+            switcher.handle_key(key(KeyCode::Char('r'))),
+            SwitcherAction::None
+        );
+        assert_eq!(
             switcher.handle_key(key(KeyCode::Enter)),
             SwitcherAction::CreateNew
+        );
+        switcher.update_scope_name(7, "backend".to_string());
+        switcher.handle_key(key(KeyCode::Up));
+        assert_eq!(
+            switcher.handle_key(key(KeyCode::Char('r'))),
+            SwitcherAction::Rename(7, "backend".to_string())
         );
         assert_eq!(
             switcher.handle_key(key(KeyCode::Esc)),

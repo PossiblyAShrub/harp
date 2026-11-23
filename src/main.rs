@@ -49,6 +49,11 @@ use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
 use view::{SnapshotView, hit_pane, pane_at, pane_content_rect};
 
+struct PendingRename {
+    scope_id: u64,
+    modal: RenameModal,
+}
+
 struct App {
     client: server::ClientConnection,
     local_server_addr: String,
@@ -71,7 +76,7 @@ struct App {
     parsers: HashMap<usize, vt100::Parser>,
     picker: Option<ScopePicker>,
     switcher: Option<ScopeSwitcher>,
-    rename: Option<RenameModal>,
+    rename: Option<PendingRename>,
     copy_mode: Option<CopyMode>,
     drag: Option<Drag>,
     /// Per-projection scrollback view offset (rows above the bottom).
@@ -1146,6 +1151,50 @@ impl App {
                     let reply = self.client.recv::<ServerMsg>()?;
                     self.handle_server_reply(reply)?;
                 }
+            } else if let Some(rename) = &mut self.rename {
+                if let Event::Key(key_event) = event {
+                    match rename.modal.handle_key(key_event) {
+                        RenameAction::None => {}
+                        RenameAction::Cancel => {
+                            self.rename = None;
+                        }
+                        RenameAction::Confirm(name) => {
+                            let scope_id = rename.scope_id;
+                            self.rename = None;
+                            self.client
+                                .send(&ClientMsg::RenameScope { scope_id, name })?;
+                            let reply = self.client.recv::<ServerMsg>()?;
+                            if self.switcher.is_some() {
+                                match reply {
+                                    ServerMsg::Snapshot(snap) => {
+                                        if let Some(switcher) = &mut self.switcher {
+                                            switcher.update_scope_name(
+                                                snap.scope_id,
+                                                snap.scope_name.clone(),
+                                            );
+                                        }
+                                        if self
+                                            .snapshot
+                                            .as_ref()
+                                            .is_some_and(|cur| cur.scope_id == snap.scope_id)
+                                        {
+                                            self.apply_snapshot(snap);
+                                        }
+                                    }
+                                    ServerMsg::ScopeClosed => {
+                                        self.open_switcher(self.snapshot.is_some())?;
+                                    }
+                                    ServerMsg::Error(e) => {
+                                        self.status.set_error(Some(e));
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                self.handle_server_reply(reply)?;
+                            }
+                        }
+                    }
+                }
             } else if let Some(switcher) = &mut self.switcher {
                 if let Event::Key(key_event) = event {
                     match switcher.handle_key(key_event) {
@@ -1160,6 +1209,12 @@ impl App {
                         SwitcherAction::Attach(id) => {
                             self.switcher = None;
                             self.attach_scope(id)?;
+                        }
+                        SwitcherAction::Rename(scope_id, current_name) => {
+                            self.rename = Some(PendingRename {
+                                scope_id,
+                                modal: RenameModal::new(current_name),
+                            });
                         }
                         SwitcherAction::CreateNew => {
                             self.switcher = None;
@@ -1184,26 +1239,6 @@ impl App {
                         }
                         SwitcherAction::AddHost => {
                             self.host_prompt = Some(String::new());
-                        }
-                    }
-                }
-            } else if let Some(rename) = &mut self.rename {
-                if let Event::Key(key_event) = event {
-                    match rename.handle_key(key_event) {
-                        RenameAction::None => {}
-                        RenameAction::Cancel => {
-                            self.rename = None;
-                        }
-                        RenameAction::Confirm(name) => {
-                            self.rename = None;
-                            if let Some(snap) = &self.snapshot {
-                                self.client.send(&ClientMsg::RenameScope {
-                                    scope_id: snap.scope_id,
-                                    name,
-                                })?;
-                                let reply = self.client.recv::<ServerMsg>()?;
-                                self.handle_server_reply(reply)?;
-                            }
                         }
                     }
                 }
@@ -1394,7 +1429,10 @@ impl App {
                                 && key_event.modifiers == KeyModifiers::NONE
                             {
                                 if let Some(snap) = &self.snapshot {
-                                    self.rename = Some(RenameModal::new(snap.scope_name.clone()));
+                                    self.rename = Some(PendingRename {
+                                        scope_id: snap.scope_id,
+                                        modal: RenameModal::new(snap.scope_name.clone()),
+                                    });
                                 }
                             } else if key_event.code == KeyCode::Char('T')
                                 && !key_event
@@ -1526,7 +1564,7 @@ impl Widget for &App {
             switcher.render(area, buf);
         }
         if let Some(rename) = &self.rename {
-            rename.render(area, buf);
+            rename.modal.render(area, buf);
         }
         if let Some(host) = &self.host_prompt {
             let popup = centered_rect(area, 60, 5);
