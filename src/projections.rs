@@ -242,12 +242,11 @@ impl ProjectionTerm {
 
         let mut cmd = CommandBuilder::new(program);
         cmd.cwd(cwd);
-        // SSH-started servers have no controlling terminal and may not receive
-        // TERM from sshd. Give child applications a usable terminal type in
-        // that case; locale variables still come from the server environment.
-        if std::env::var_os("TERM").is_none() {
-            cmd.env("TERM", "xterm-256color");
-        }
+        // Child applications run inside harp's vt100 terminal emulator rather
+        // than directly in the host terminal. Force TERM=xterm-256color so
+        // apps don't emit host-specific sequences (e.g. xterm-kitty/ghostty
+        // HPA or kitty keyboard extensions) that vt100 doesn't implement.
+        cmd.env("TERM", "xterm-256color");
         let mut child = pty.slave.spawn_command(cmd)?;
         crate::debug::log_debug_event(format!("started projection: {program}"));
         let killer = child.clone_killer();
@@ -275,6 +274,8 @@ impl ProjectionTerm {
         thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             let mut filter = PassthroughFilter::new();
+            let mut sync_buf = Vec::new();
+            const MAX_SYNC_BUF: usize = 1024 * 1024;
 
             while let Ok(n) = reader.read(&mut buffer) {
                 if n == 0 {
@@ -285,9 +286,9 @@ impl ProjectionTerm {
                 let mut passthrough = Vec::new();
                 let mut responses = Vec::new();
                 let cell_px = *cell_px_clone.lock().unwrap();
-                let size = {
+                let (size, cursor) = {
                     let parser = parser_clone.lock().unwrap();
-                    parser.screen().size()
+                    (parser.screen().size(), parser.screen().cursor_position())
                 };
                 filter.feed(
                     &buffer[..n],
@@ -296,11 +297,9 @@ impl ProjectionTerm {
                     &mut responses,
                     cell_px,
                     size,
+                    cursor,
                 );
 
-                if !screen.is_empty() {
-                    parser_clone.lock().unwrap().process(&screen);
-                }
                 if !responses.is_empty()
                     && let Some(writer) = writer_clone.lock().unwrap().as_mut()
                 {
@@ -313,6 +312,25 @@ impl ProjectionTerm {
                         .unwrap()
                         .extend_from_slice(&passthrough);
                 }
+
+                if filter.in_sync_update() && sync_buf.len() + screen.len() <= MAX_SYNC_BUF {
+                    sync_buf.extend_from_slice(&screen);
+                    continue;
+                }
+
+                if !sync_buf.is_empty() {
+                    sync_buf.extend_from_slice(&screen);
+                    parser_clone.lock().unwrap().process(&sync_buf);
+                    sync_buf.clear();
+                } else if !screen.is_empty() {
+                    parser_clone.lock().unwrap().process(&screen);
+                }
+                revision_clone.fetch_add(1, Ordering::Release);
+                wake_watchers();
+            }
+
+            if !sync_buf.is_empty() {
+                parser_clone.lock().unwrap().process(&sync_buf);
                 revision_clone.fetch_add(1, Ordering::Release);
                 wake_watchers();
             }
@@ -509,6 +527,12 @@ impl ProjectionTerm {
 /// calls, so the state carries over between reads.
 struct PassthroughFilter {
     state: FilterState,
+    in_sync_update: bool,
+    last_char: Option<[u8; 4]>,
+    last_char_len: u8,
+    utf8_buf: [u8; 4],
+    utf8_len: u8,
+    utf8_expected: u8,
 }
 
 enum FilterState {
@@ -517,7 +541,6 @@ enum FilterState {
     /// Inside a CSI sequence; collects parameter bytes until the final byte.
     Csi {
         params: Vec<u8>,
-        private: bool,
     },
     /// Inside an APC sequence (graphics transmission), collected for
     /// forwarding.
@@ -525,8 +548,11 @@ enum FilterState {
         buf: Vec<u8>,
         saw_esc: bool,
     },
-    /// Inside an OSC sequence; fed straight through to the screen parser.
+    /// Inside an OSC sequence; short sequences are buffered to inspect queries,
+    /// long ones stream straight through to the screen parser.
     Osc {
+        buf: Vec<u8>,
+        streaming: bool,
         saw_esc: bool,
     },
 }
@@ -535,12 +561,64 @@ impl PassthroughFilter {
     fn new() -> Self {
         Self {
             state: FilterState::Normal,
+            in_sync_update: false,
+            last_char: None,
+            last_char_len: 0,
+            utf8_buf: [0; 4],
+            utf8_len: 0,
+            utf8_expected: 0,
+        }
+    }
+
+    fn in_sync_update(&self) -> bool {
+        self.in_sync_update
+    }
+
+    fn record_normal_byte(&mut self, b: u8) {
+        if b < 0x20 || b == 0x7f {
+            self.utf8_len = 0;
+            self.utf8_expected = 0;
+            return;
+        }
+        if b < 0x80 {
+            self.last_char = Some([b, 0, 0, 0]);
+            self.last_char_len = 1;
+            self.utf8_len = 0;
+            self.utf8_expected = 0;
+            return;
+        }
+        if b >= 0xc2 {
+            self.utf8_buf[0] = b;
+            self.utf8_len = 1;
+            self.utf8_expected = if b < 0xe0 {
+                2
+            } else if b < 0xf0 {
+                3
+            } else {
+                4
+            };
+        } else if (0x80..=0xbf).contains(&b) && self.utf8_len > 0 {
+            let idx = usize::from(self.utf8_len);
+            if idx < 4 {
+                self.utf8_buf[idx] = b;
+                self.utf8_len += 1;
+                if self.utf8_len == self.utf8_expected {
+                    self.last_char = Some(self.utf8_buf);
+                    self.last_char_len = self.utf8_len;
+                    self.utf8_len = 0;
+                    self.utf8_expected = 0;
+                }
+            }
+        } else {
+            self.utf8_len = 0;
+            self.utf8_expected = 0;
         }
     }
 
     /// Processes one chunk of pty output. `screen` gets the bytes that should
     /// go into the vt100 parser, `passthrough` the bytes to forward to the
     /// real terminal, and `responses` the bytes to write back into the pty.
+    #[allow(clippy::too_many_arguments)]
     fn feed(
         &mut self,
         bytes: &[u8],
@@ -549,12 +627,14 @@ impl PassthroughFilter {
         responses: &mut Vec<u8>,
         cell_px: (u16, u16),
         size: (u16, u16),
+        cursor: (u16, u16),
     ) {
         for &b in bytes {
-            self.feed_byte(b, screen, passthrough, responses, cell_px, size);
+            self.feed_byte(b, screen, passthrough, responses, cell_px, size, cursor);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn feed_byte(
         &mut self,
         b: u8,
@@ -563,32 +643,36 @@ impl PassthroughFilter {
         responses: &mut Vec<u8>,
         cell_px: (u16, u16),
         size: (u16, u16),
+        cursor: (u16, u16),
     ) {
         match std::mem::replace(&mut self.state, FilterState::Normal) {
             FilterState::Normal => {
                 if b == 0x1b {
+                    self.utf8_len = 0;
+                    self.utf8_expected = 0;
                     self.state = FilterState::Esc;
                 } else {
+                    self.record_normal_byte(b);
                     screen.push(b);
                     self.state = FilterState::Normal;
                 }
             }
             FilterState::Esc => match b {
                 b'[' => {
-                    self.state = FilterState::Csi {
-                        params: Vec::new(),
-                        private: false,
-                    }
+                    self.state = FilterState::Csi { params: Vec::new() };
                 }
                 b'_' => {
                     self.state = FilterState::Apc {
                         buf: vec![0x1b, b'_'],
                         saw_esc: false,
-                    }
+                    };
                 }
                 b']' => {
-                    screen.extend_from_slice(b"\x1b]");
-                    self.state = FilterState::Osc { saw_esc: false };
+                    self.state = FilterState::Osc {
+                        buf: Vec::new(),
+                        streaming: false,
+                        saw_esc: false,
+                    };
                 }
                 _ => {
                     screen.push(0x1b);
@@ -596,31 +680,28 @@ impl PassthroughFilter {
                     self.state = FilterState::Normal;
                 }
             },
-            FilterState::Csi {
-                mut params,
-                mut private,
-            } => {
+            FilterState::Csi { mut params } => {
                 if (0x40..=0x7e).contains(&b) {
-                    // Final byte. Answer terminal queries here (the real
-                    // terminal's replies can't be relayed back through the
-                    // client), forward everything else to the screen parser.
-                    if !private
-                        && let Some(response) = device_query_response(&params, b, cell_px, size)
+                    // Final byte.
+                    if params == b"?2026" && (b == b'h' || b == b'l') {
+                        self.in_sync_update = b == b'h';
+                    } else if let Some(response) =
+                        device_query_response(&params, b, cell_px, size, cursor, self.in_sync_update)
                     {
                         responses.extend_from_slice(&response);
-                        self.state = FilterState::Normal;
                     } else {
-                        screen.extend_from_slice(b"\x1b[");
-                        screen.extend_from_slice(&params);
-                        screen.push(b);
-                        self.state = FilterState::Normal;
+                        emit_translated_csi(
+                            &params,
+                            b,
+                            size,
+                            self.last_char.as_ref().map(|c| &c[..usize::from(self.last_char_len)]),
+                            screen,
+                        );
                     }
+                    self.state = FilterState::Normal;
                 } else {
-                    if b == b'?' && params.is_empty() && !private {
-                        private = true;
-                    }
                     params.push(b);
-                    self.state = FilterState::Csi { params, private };
+                    self.state = FilterState::Csi { params };
                 }
             }
             FilterState::Apc { mut buf, saw_esc } => {
@@ -648,30 +729,227 @@ impl PassthroughFilter {
                     }
                 }
             }
-            FilterState::Osc { saw_esc } => match (saw_esc, b) {
-                (true, b'\\') => {
-                    screen.push(b'\\');
-                    self.state = FilterState::Normal;
-                }
-                (true, _) => {
+            FilterState::Osc {
+                mut buf,
+                mut streaming,
+                saw_esc,
+            } => {
+                const MAX_OSC_QUERY_LEN: usize = 64;
+                if streaming {
                     screen.push(b);
-                    self.state = FilterState::Osc { saw_esc: false };
+                    match (saw_esc, b) {
+                        (true, b'\\') | (false, 0x07) => {
+                            self.state = FilterState::Normal;
+                        }
+                        (false, 0x1b) => {
+                            self.state = FilterState::Osc {
+                                buf,
+                                streaming: true,
+                                saw_esc: true,
+                            };
+                        }
+                        _ => {
+                            self.state = FilterState::Osc {
+                                buf,
+                                streaming: true,
+                                saw_esc: false,
+                            };
+                        }
+                    }
+                } else {
+                    match (saw_esc, b) {
+                        (true, b'\\') => {
+                            // `buf` ends with the 0x1b of ST; strip it before matching.
+                            let body = buf.strip_suffix(b"\x1b").unwrap_or(&buf);
+                            if let Some(resp) = osc_query_response(body, b"\x1b\\") {
+                                responses.extend_from_slice(&resp);
+                            } else {
+                                screen.extend_from_slice(b"\x1b]");
+                                screen.extend_from_slice(body);
+                                screen.extend_from_slice(b"\x1b\\");
+                            }
+                            self.state = FilterState::Normal;
+                        }
+                        (false, 0x07) => {
+                            if let Some(resp) = osc_query_response(&buf, b"\x07") {
+                                responses.extend_from_slice(&resp);
+                            } else {
+                                screen.extend_from_slice(b"\x1b]");
+                                screen.extend_from_slice(&buf);
+                                screen.push(0x07);
+                            }
+                            self.state = FilterState::Normal;
+                        }
+                        _ => {
+                            buf.push(b);
+                            let next_saw_esc = !saw_esc && b == 0x1b;
+                            if buf.len() > MAX_OSC_QUERY_LEN {
+                                screen.extend_from_slice(b"\x1b]");
+                                screen.extend_from_slice(&buf);
+                                buf.clear();
+                                streaming = true;
+                            }
+                            self.state = FilterState::Osc {
+                                buf,
+                                streaming,
+                                saw_esc: next_saw_esc,
+                            };
+                        }
+                    }
                 }
-                (false, 0x07) => {
-                    screen.push(b);
-                    self.state = FilterState::Normal;
-                }
-                (false, 0x1b) => {
-                    screen.push(b);
-                    self.state = FilterState::Osc { saw_esc: true };
-                }
-                (false, _) => {
-                    screen.push(b);
-                    self.state = FilterState::Osc { saw_esc: false };
-                }
-            },
+            }
         }
     }
+}
+
+/// Translates CSI sequences that `vt100` does not implement (HPA, HVP, REP,
+/// CHT, and colon-separated or extended SGR parameters) into equivalent
+/// sequences `vt100` understands so modern TUIs render accurately.
+fn emit_translated_csi(
+    params: &[u8],
+    final_byte: u8,
+    size: (u16, u16),
+    last_char: Option<&[u8]>,
+    screen: &mut Vec<u8>,
+) {
+    match final_byte {
+        // HPA (`CSI n \``) -> CHA (`CSI n G`).
+        b'`' => {
+            screen.extend_from_slice(b"\x1b[");
+            screen.extend_from_slice(params);
+            screen.push(b'G');
+        }
+        // HVP (`CSI r;c f`) -> CUP (`CSI r;c H`).
+        b'f' => {
+            screen.extend_from_slice(b"\x1b[");
+            screen.extend_from_slice(params);
+            screen.push(b'H');
+        }
+        // REP (`CSI n b`): repeat the previous printed character `n` times.
+        b'b' => {
+            if let Some(ch) = last_char {
+                let cap = usize::from(size.1).clamp(256, 4096);
+                let count = parse_csi_u16(params).unwrap_or(1).max(1) as usize;
+                for _ in 0..count.min(cap) {
+                    screen.extend_from_slice(ch);
+                }
+            }
+        }
+        // CHT (`CSI n I`): cursor horizontal forward tab `n` times.
+        b'I' => {
+            let count = parse_csi_u16(params).unwrap_or(1).clamp(1, 256);
+            for _ in 0..count {
+                screen.push(b'\t');
+            }
+        }
+        // SGR (`CSI ... m`): normalize colon subparameters and strip
+        // unsupported codes (like 9/29/58/59) that cause vt100 to abort the
+        // rest of the SGR sequence.
+        b'm' if needs_sgr_normalization(params) => {
+            emit_normalized_sgr(params, screen);
+        }
+        _ => {
+            screen.extend_from_slice(b"\x1b[");
+            screen.extend_from_slice(params);
+            screen.push(final_byte);
+        }
+    }
+}
+
+fn parse_csi_u16(params: &[u8]) -> Option<u16> {
+    if params.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(params).ok()?.parse::<u16>().ok()
+}
+
+fn needs_sgr_normalization(params: &[u8]) -> bool {
+    params.contains(&b':')
+        || params
+            .split(|&b| b == b';')
+            .any(|p| matches!(p, b"9" | b"29" | b"58" | b"59"))
+}
+
+fn emit_normalized_sgr(params: &[u8], screen: &mut Vec<u8>) {
+    let mut out_parts: Vec<String> = Vec::new();
+    let parts: Vec<&[u8]> = params.split(|&b| b == b';').collect();
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        if part.contains(&b':') {
+            let sub: Vec<&[u8]> = part.split(|&b| b == b':').collect();
+            match sub.as_slice() {
+                // `38:2:[cs]:r:g:b` or `48:2:[cs]:r:g:b`
+                [kind @ (b"38" | b"48"), b"2", _, r, g, b]
+                | [kind @ (b"38" | b"48"), b"2", r, g, b] => {
+                    out_parts.push(format!(
+                        "{};2;{};{};{}",
+                        String::from_utf8_lossy(kind),
+                        String::from_utf8_lossy(r),
+                        String::from_utf8_lossy(g),
+                        String::from_utf8_lossy(b),
+                    ));
+                }
+                // `38:5:idx` or `48:5:idx`
+                [kind @ (b"38" | b"48"), b"5", idx] => {
+                    out_parts.push(format!(
+                        "{};5;{}",
+                        String::from_utf8_lossy(kind),
+                        String::from_utf8_lossy(idx),
+                    ));
+                }
+                // Styled underline `4:0`..`4:5`
+                [b"4", style] => {
+                    if *style == b"0" {
+                        out_parts.push("24".to_string());
+                    } else {
+                        out_parts.push("4".to_string());
+                    }
+                }
+                // Underline color `58:...` -> drop so vt100 doesn't abort.
+                [b"58", ..] => {}
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match part {
+            // Semicolon-separated underline color `58;2;r;g;b` or `58;5;i`.
+            b"58" => {
+                if parts.get(i + 1) == Some(&b"2".as_slice()) {
+                    i += 5;
+                } else if parts.get(i + 1) == Some(&b"5".as_slice()) {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            b"9" | b"29" | b"59" => {
+                i += 1;
+            }
+            _ => {
+                out_parts.push(String::from_utf8_lossy(part).into_owned());
+                i += 1;
+            }
+        }
+    }
+    if !out_parts.is_empty() {
+        screen.extend_from_slice(b"\x1b[");
+        screen.extend_from_slice(out_parts.join(";").as_bytes());
+        screen.push(b'm');
+    }
+}
+
+fn osc_query_response(body: &[u8], terminator: &[u8]) -> Option<Vec<u8>> {
+    let prefix = match body {
+        b"10;?" => b"\x1b]10;rgb:ffff/ffff/ffff".as_slice(),
+        b"11;?" => b"\x1b]11;rgb:0000/0000/0000".as_slice(),
+        _ => return None,
+    };
+    let mut resp = Vec::with_capacity(prefix.len() + terminator.len());
+    resp.extend_from_slice(prefix);
+    resp.extend_from_slice(terminator);
+    Some(resp)
 }
 
 /// Builds the response to a terminal query, if it is one that the server can
@@ -681,6 +959,8 @@ fn device_query_response(
     final_byte: u8,
     cell_px: (u16, u16),
     size: (u16, u16),
+    cursor: (u16, u16),
+    in_sync_update: bool,
 ) -> Option<Vec<u8>> {
     match (params, final_byte) {
         // CSI 16 t: character cell size in pixels.
@@ -699,12 +979,28 @@ fn device_query_response(
             let h = u32::from(cell_h) * u32::from(rows);
             Some(format!("\x1b[4;{h};{w}t").into_bytes())
         }
-        // CSI c: primary device attributes (DA). Answer as a VT100-style
+        // CSI c / CSI 0 c: primary device attributes (DA). Answer as a VT100-style
         // terminal with advanced video, which is what icat's support
         // detection waits for.
-        (b"", b'c') => Some(b"\x1b[?1;2c".to_vec()),
+        (b"" | b"0", b'c') => Some(b"\x1b[?1;2c".to_vec()),
         // CSI > ... c: secondary device attributes (DA2).
         ([b'>', ..], b'c') => Some(b"\x1b[>0;0;0c".to_vec()),
+        // CSI 5 n: device status report (DSR) -> terminal OK.
+        (b"5", b'n') => Some(b"\x1b[0n".to_vec()),
+        // CSI 6 n: cursor position report (CPR) -> 1-based row;col.
+        (b"6", b'n') => {
+            let (row, col) = cursor;
+            Some(format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1)).into_bytes())
+        }
+        // CSI ? 2026 $ p: DECRQM for synchronized output.
+        (b"?2026$", b'p') => {
+            let state = if in_sync_update { 1 } else { 2 };
+            Some(format!("\x1b[?2026;{state}$y").into_bytes())
+        }
+        // CSI ? 2027 $ p: DECRQM for grapheme clustering (not supported by vt100).
+        (b"?2027$", b'p') => Some(b"\x1b[?2027;0$y".to_vec()),
+        // CSI ? u: kitty keyboard protocol query -> disabled.
+        (b"?", b'u') => Some(b"\x1b[?0u".to_vec()),
         _ => None,
     }
 }
@@ -1399,9 +1695,45 @@ mod tests {
                 &mut responses,
                 cell_px,
                 size,
+                (0, 0),
             );
         }
         (screen, passthrough, responses)
+    }
+
+    #[test]
+    fn passthrough_filter_translates_hpa_hvp_rep_cht_and_colon_sgr() {
+        // HPA (`) -> CHA (G), HVP (f) -> CUP (H), REP (b) repeats last char.
+        let (screen, _, _) = feed_split(
+            &["\x1b[6`─\x1b[3b\x1b[2;4f\x1b[38:2::10:20:30;4:3;9mX\x1b[m".as_bytes()],
+            (10, 20),
+            (24, 80),
+        );
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(&screen);
+        let s = parser.screen();
+        // Row 0, cols 5..9 (1-based col 6) should have 4 '─' characters.
+        assert_eq!(s.cell(0, 5).unwrap().contents(), "─");
+        assert_eq!(s.cell(0, 8).unwrap().contents(), "─");
+        // Row 1, col 3 (1-based 2;4) should have 'X' with RGB(10,20,30) and underline.
+        let x_cell = s.cell(1, 3).unwrap();
+        assert_eq!(x_cell.contents(), "X");
+        assert_eq!(x_cell.fgcolor(), vt100::Color::Rgb(10, 20, 30));
+        assert!(x_cell.underline());
+    }
+
+    #[test]
+    fn passthrough_filter_answers_modern_tui_queries_and_sync_output() {
+        let (screen, _, responses) = feed_split(
+            &[b"\x1b[?2026$p\x1b[?2027$p\x1b]11;?\x07\x1b[?u\x1b[6n\x1b[?2026hhi\x1b[?2026l"],
+            (10, 20),
+            (24, 80),
+        );
+        assert_eq!(
+            responses,
+            b"\x1b[?2026;2$y\x1b[?2027;0$y\x1b]11;rgb:0000/0000/0000\x07\x1b[?0u\x1b[1;1R"
+        );
+        assert_eq!(screen, b"hi");
     }
 
     #[test]
