@@ -91,8 +91,7 @@ fn stream_log(log: &EventLog, title: &str, mut stream: UnixStream, closed: &Atom
         let (next_seq, lines) = log.since(last_seq);
         if !lines.is_empty() {
             for line in lines {
-                if stream.write_all(line.as_bytes()).is_err()
-                    || stream.write_all(b"\r\n").is_err()
+                if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\r\n").is_err()
                 {
                     return;
                 }

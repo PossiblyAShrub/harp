@@ -190,9 +190,7 @@ fn read_frame<T: DeserializeOwned>(
 
     let plaintext = cipher
         .decrypt(&Nonce::from(nonce_bytes), ciphertext.as_slice())
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decrypt error: {e}")))?;
 
     serde_json::from_slice(&plaintext)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode error: {e}")))

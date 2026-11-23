@@ -241,10 +241,7 @@ pub enum ClientMsg {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Ok,
-    Version {
-        protocol: u32,
-        version: String,
-    },
+    Version { protocol: u32, version: String },
     Scopes(Vec<ScopeInfo>),
     Hosts(Vec<HostInfo>),
     Snapshot(ScopeSnapshot),

@@ -771,16 +771,23 @@ impl PassthroughFilter {
                     // Final byte.
                     if params == b"?2026" && (b == b'h' || b == b'l') {
                         self.in_sync_update = b == b'h';
-                    } else if let Some(response) =
-                        device_query_response(&params, b, cell_px, size, cursor, self.in_sync_update)
-                    {
+                    } else if let Some(response) = device_query_response(
+                        &params,
+                        b,
+                        cell_px,
+                        size,
+                        cursor,
+                        self.in_sync_update,
+                    ) {
                         responses.extend_from_slice(&response);
                     } else {
                         emit_translated_csi(
                             &params,
                             b,
                             size,
-                            self.last_char.as_ref().map(|c| &c[..usize::from(self.last_char_len)]),
+                            self.last_char
+                                .as_ref()
+                                .map(|c| &c[..usize::from(self.last_char_len)]),
                             screen,
                         );
                     }
@@ -1962,8 +1969,7 @@ printf 'RESP:%s\n' "$r"
 
     #[test]
     fn title_callbacks_track_osc_titles_and_clear_on_empty() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, TitleCallbacks::default());
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, TitleCallbacks::default());
         assert_eq!(parser.callbacks().title(), None);
 
         parser.process(b"\x1b]0;build: app\x07");

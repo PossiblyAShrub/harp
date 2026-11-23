@@ -586,9 +586,11 @@ impl TileNode {
                     return true;
                 }
 
-                children
-                    .iter_mut()
-                    .any(|child| child.node.split_leaf(target_id, dir, new_id, new_projection))
+                children.iter_mut().any(|child| {
+                    child
+                        .node
+                        .split_leaf(target_id, dir, new_id, new_projection)
+                })
             }
             TileNode::Tabs { pages, .. } => {
                 if pages.iter().any(|p| p.id == target_id)

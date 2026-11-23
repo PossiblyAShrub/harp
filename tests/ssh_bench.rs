@@ -47,7 +47,10 @@ fn open_direct_harp(laptop: &Machine) -> Term {
 
 fn open_tunnel_new_scope(laptop: &Machine) -> Term {
     let mut t = laptop.harp(&["--ssh", "devbox"], (120, 35));
-    t.wait_for(|s| s.contains("New Scope on devbox"), Duration::from_secs(15));
+    t.wait_for(
+        |s| s.contains("New Scope on devbox"),
+        Duration::from_secs(15),
+    );
     // Move past "+ New Scope" to "+ New Scope on devbox"
     t.send("\x1b[B\r");
     t.wait_for(
@@ -108,7 +111,10 @@ fn bench_connect_and_attach_latency() {
         // 1. Cold connect: harp --ssh devbox -> switcher shows "New Scope on devbox"
         let t0 = Instant::now();
         let mut t = laptop.harp(&["--ssh", "devbox"], (120, 35));
-        t.wait_for(|s| s.contains("New Scope on devbox"), Duration::from_secs(15));
+        t.wait_for(
+            |s| s.contains("New Scope on devbox"),
+            Duration::from_secs(15),
+        );
         let cold_connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Create remote scope on devbox
@@ -189,9 +195,7 @@ fn bench_keystroke_rtt_sweep() {
     let delta_rtt = (rtts[3] - rtts[0]) as f64;
     let direct_slope = (direct_p50s[3] - direct_p50s[0]) / delta_rtt;
     let tunnel_slope = (tunnel_p50s[3] - tunnel_p50s[0]) / delta_rtt;
-    println!(
-        "slope (d_p50 / d_RTT): ssh+harp={direct_slope:.2}x | tunnel={tunnel_slope:.2}x"
-    );
+    println!("slope (d_p50 / d_RTT): ssh+harp={direct_slope:.2}x | tunnel={tunnel_slope:.2}x");
 }
 
 #[test]

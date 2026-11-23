@@ -37,15 +37,24 @@ fn ssh_remote_scope_create_echo_and_persist() {
 
     // 1. Connect laptop -> devbox via harp --ssh devbox
     let mut t = laptop.harp(&["--ssh", "devbox"], (120, 35));
-    t.wait_for(|s| s.contains("New Scope on devbox"), Duration::from_secs(10));
+    t.wait_for(
+        |s| s.contains("New Scope on devbox"),
+        Duration::from_secs(10),
+    );
 
     // Move selection in switcher to "+ New Scope on devbox" and press Enter.
     // Switcher items with 0 scopes: [0] + New Scope, [1] + New Scope on devbox.
     t.send("\x1b[B\r");
     // Wait until the remote scope is actually attached before switching to Interacting.
-    t.wait_for(|s| s.contains("MANAGING") && s.contains("scope-1"), Duration::from_secs(10));
+    t.wait_for(
+        |s| s.contains("MANAGING") && s.contains("scope-1"),
+        Duration::from_secs(10),
+    );
     t.send("\r");
-    t.wait_for(|s| s.contains("INTERACTING") && s.contains('#'), Duration::from_secs(5));
+    t.wait_for(
+        |s| s.contains("INTERACTING") && s.contains('#'),
+        Duration::from_secs(5),
+    );
 
     t.send("echo lab-host-$(uname -n)\r");
     t.wait_for(|s| s.contains("lab-host-devbox"), Duration::from_secs(5));
@@ -68,11 +77,20 @@ fn ssh_uploads_binary_when_remote_lacks_harp() {
     let _nobox = world.machine_without_harp("nobox");
 
     let mut t = laptop.harp(&["--ssh", "nobox"], (120, 35));
-    t.wait_for(|s| s.contains("New Scope on nobox"), Duration::from_secs(10));
+    t.wait_for(
+        |s| s.contains("New Scope on nobox"),
+        Duration::from_secs(10),
+    );
     t.send("\x1b[B\r");
-    t.wait_for(|s| s.contains("MANAGING") && s.contains("scope-1"), Duration::from_secs(15));
+    t.wait_for(
+        |s| s.contains("MANAGING") && s.contains("scope-1"),
+        Duration::from_secs(15),
+    );
     t.send("\r");
-    t.wait_for(|s| s.contains("INTERACTING") && s.contains('#'), Duration::from_secs(5));
+    t.wait_for(
+        |s| s.contains("INTERACTING") && s.contains('#'),
+        Duration::from_secs(5),
+    );
     t.send("echo uploaded-to-$(uname -n)\r");
     t.wait_for(|s| s.contains("uploaded-to-nobox"), Duration::from_secs(5));
 }
@@ -86,19 +104,34 @@ fn benchmark_keystroke_latency_ssh_vs_tunnel() {
 
     // Path A: ssh devbox -t harp
     let mut direct = laptop.term("ssh", &["-t", "devbox", "harp"], (120, 35));
-    direct.wait_for(|s| s.contains("MANAGING") && s.contains('#'), Duration::from_secs(10));
+    direct.wait_for(
+        |s| s.contains("MANAGING") && s.contains('#'),
+        Duration::from_secs(10),
+    );
     direct.send("\r");
-    direct.wait_for(|s| s.contains("INTERACTING") && s.contains('#'), Duration::from_secs(5));
+    direct.wait_for(
+        |s| s.contains("INTERACTING") && s.contains('#'),
+        Duration::from_secs(5),
+    );
     direct.send("stty raw -echo; cat\r");
     std::thread::sleep(Duration::from_millis(100));
 
     // Path B: local harp --ssh devbox
     let mut tunnel = laptop.harp(&["--ssh", "devbox"], (120, 35));
-    tunnel.wait_for(|s| s.contains("New Scope on devbox"), Duration::from_secs(10));
+    tunnel.wait_for(
+        |s| s.contains("New Scope on devbox"),
+        Duration::from_secs(10),
+    );
     tunnel.send("\x1b[B\r");
-    tunnel.wait_for(|s| s.contains("MANAGING") && s.contains('#'), Duration::from_secs(10));
+    tunnel.wait_for(
+        |s| s.contains("MANAGING") && s.contains('#'),
+        Duration::from_secs(10),
+    );
     tunnel.send("\r");
-    tunnel.wait_for(|s| s.contains("INTERACTING") && s.contains('#'), Duration::from_secs(5));
+    tunnel.wait_for(
+        |s| s.contains("INTERACTING") && s.contains('#'),
+        Duration::from_secs(5),
+    );
     tunnel.send("stty raw -echo; cat\r");
     std::thread::sleep(Duration::from_millis(100));
 

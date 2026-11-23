@@ -283,9 +283,9 @@ impl ClientConnection {
     }
 
     fn recv_rpc(&mut self) -> io::Result<ServerMsg> {
-        self.rpc_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "server connection closed")
-        })?
+        self.rpc_rx
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "server connection closed"))?
     }
 
     pub fn send(&mut self, value: &ClientMsg) -> std::io::Result<()> {
@@ -357,7 +357,8 @@ impl ClientConnection {
             let mut scopes: Vec<ScopeInfo> = self.recv_rpc()?.into_scopes()?;
             for index in 0..self.peers.len() {
                 let host_name = self.peers[index].0.name.clone();
-                let mut remote: Vec<ScopeInfo> = self.peers[index].1.recv::<ServerMsg>()?.into_scopes()?;
+                let mut remote: Vec<ScopeInfo> =
+                    self.peers[index].1.recv::<ServerMsg>()?.into_scopes()?;
                 let catalog = remote.clone();
                 self.writer.send(&ClientMsg::SyncRemoteScopes {
                     host: host_name.clone(),

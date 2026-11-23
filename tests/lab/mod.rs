@@ -363,11 +363,7 @@ impl Term {
         self.parser.lock().unwrap().screen().contents()
     }
 
-    pub fn try_wait_for(
-        &self,
-        pred: impl Fn(&str) -> bool,
-        timeout: Duration,
-    ) -> Option<Duration> {
+    pub fn try_wait_for(&self, pred: impl Fn(&str) -> bool, timeout: Duration) -> Option<Duration> {
         let start = Instant::now();
         loop {
             let text = self.screen_text();
