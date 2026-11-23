@@ -52,6 +52,11 @@ impl EncryptedWriter {
             msg,
         )
     }
+
+    /// Shut down both halves of the underlying TCP stream so any blocked reader unblocks.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
 }
 
 impl EncryptedStream {

@@ -430,6 +430,7 @@ impl ClientConnection {
 
 impl Drop for ClientConnection {
     fn drop(&mut self) {
+        let _ = self.writer.shutdown();
         if let Some(tunnel) = &mut self._tunnel {
             let _ = tunnel.kill();
             let _ = tunnel.wait();
@@ -566,6 +567,19 @@ struct ServerState {
 }
 
 impl ServerState {
+    fn empty() -> Self {
+        Self {
+            scopes: Vec::new(),
+            peer_masters: Vec::new(),
+            peers: Vec::new(),
+            remote_scopes: Vec::new(),
+            connecting_peers: std::collections::HashSet::new(),
+            next_id: 1,
+            had_scopes: false,
+            cell_px: (0, 0),
+        }
+    }
+
     fn new() -> Self {
         let peers: Vec<HostInfo> = peer_store_path()
             .and_then(|path| std::fs::read(path).ok())
@@ -575,16 +589,11 @@ impl ServerState {
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        Self {
-            scopes: Vec::new(),
-            peer_masters: std::iter::repeat_with(|| None).take(peers.len()).collect(),
-            peers,
-            remote_scopes,
-            connecting_peers: std::collections::HashSet::new(),
-            next_id: 1,
-            had_scopes: false,
-            cell_px: (0, 0),
-        }
+        let mut state = Self::empty();
+        state.peer_masters = std::iter::repeat_with(|| None).take(peers.len()).collect();
+        state.peers = peers;
+        state.remote_scopes = remote_scopes;
+        state
     }
 
     fn prune_all(&mut self) {
@@ -1453,7 +1462,7 @@ mod tests {
 
     #[test]
     fn server_exits_only_after_scopes_have_been_created_and_all_removed() {
-        let mut state = ServerState::new();
+        let mut state = ServerState::empty();
         assert!(!state.should_exit());
 
         state.had_scopes = true;
