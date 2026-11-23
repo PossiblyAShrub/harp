@@ -47,7 +47,7 @@ use protocol::{
 };
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
-use view::{SnapshotView, pane_at, pane_content_rect};
+use view::{SnapshotView, hit_pane, pane_at, pane_content_rect};
 
 struct App {
     client: server::ClientConnection,
@@ -283,6 +283,34 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_tab_click(&mut self, mouse: MouseEvent) -> io::Result<bool> {
+        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+            return Ok(false);
+        }
+        let Some(snap) = &self.snapshot else {
+            return Ok(false);
+        };
+        let Some(pane) = hit_pane(
+            &snap.root,
+            self.workspace_area,
+            Position::new(mouse.column, mouse.row),
+        ) else {
+            return Ok(false);
+        };
+        let Some((id, _)) = pane.tab else {
+            return Ok(false);
+        };
+        self.copy_mode = None;
+        self.last_click = None;
+        self.client.send(&ClientMsg::ActivateProjection {
+            scope_id: snap.scope_id,
+            projection_id: id,
+        })?;
+        let reply = self.client.recv::<ServerMsg>()?;
+        self.handle_server_reply(reply)?;
+        Ok(true)
     }
 
     fn apply_snapshot(&mut self, snap: ScopeSnapshot) {
@@ -1232,10 +1260,10 @@ impl App {
                     }
                 }
             } else if let Event::Mouse(mouse) = &event
-                && self.mode == Mode::Managing
-                && self.handle_layout_mouse(*mouse)?
+                && ((self.mode == Mode::Managing && self.handle_layout_mouse(*mouse)?)
+                    || (self.mode == Mode::Interacting && self.handle_tab_click(*mouse)?))
             {
-                // A layout gesture owns the mouse from press to release.
+                // A layout gesture or tab click owns the mouse.
             } else if let Event::Mouse(mouse) = &event
                 && self.start_mouse_selection(*mouse)
             {
@@ -1787,6 +1815,105 @@ impl Drop for MouseCaptureGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clicking_tab_in_interacting_mode_switches_tab() {
+        use std::net::{TcpListener, TcpStream};
+
+        let make_snapshot = |active: usize, focused_id: usize, revision: u64| ScopeSnapshot {
+            scope_id: 1,
+            scope_name: "test".to_string(),
+            revision,
+            focused_id,
+            passthrough: String::new(),
+            root: SnapshotNode::Tabs {
+                active,
+                pages: vec![
+                    crate::protocol::TabPageSnapshot {
+                        id: 1,
+                        name: "Tab1".to_string(),
+                        cols: 78,
+                        rows: 21,
+                        state: Vec::new(),
+                        scrollback: Vec::new(),
+                        alternate_screen: false,
+                    },
+                    crate::protocol::TabPageSnapshot {
+                        id: 2,
+                        name: "Tab2".to_string(),
+                        cols: 78,
+                        rows: 21,
+                        state: Vec::new(),
+                        scrollback: Vec::new(),
+                        alternate_screen: false,
+                    },
+                ],
+            },
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut enc = crate::crypto::EncryptedStream::handshake_server(stream).unwrap();
+            while let Ok(msg) = enc.recv::<ClientMsg>() {
+                match msg {
+                    ClientMsg::CheckVersion { .. } => enc
+                        .send(&ServerMsg::Version {
+                            protocol: crate::protocol::PROTOCOL_VERSION,
+                            version: env!("CARGO_PKG_VERSION").to_string(),
+                        })
+                        .unwrap(),
+                    ClientMsg::ListScopes => enc.send(&ServerMsg::Scopes(Vec::new())).unwrap(),
+                    ClientMsg::CreateScope { .. } => {
+                        enc.send(&ServerMsg::Snapshot(make_snapshot(0, 1, 1)))
+                            .unwrap();
+                    }
+                    ClientMsg::ActivateProjection {
+                        scope_id: 1,
+                        projection_id: 2,
+                    } => {
+                        enc.send(&ServerMsg::Snapshot(make_snapshot(1, 2, 2)))
+                            .unwrap();
+                    }
+                    ClientMsg::Subscribe { .. } => {}
+                    other => panic!("unexpected client message: {other:?}"),
+                }
+            }
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let conn = server::ClientConnection::from_stream(
+            crate::crypto::EncryptedStream::handshake_client(stream).unwrap(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut app =
+            App::new(conn, Vec::new(), addr.to_string(), Rect::new(0, 0, 80, 24)).unwrap();
+        app.set_mode(Mode::Interacting);
+
+        // Tab1 ("  Tab1  ") occupies x=1..9 on row 0; Tab2 ("  Tab2  ") starts at x=9.
+        app.handle_events(vec![Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })])
+        .unwrap();
+
+        assert_eq!(app.mode, Mode::Interacting);
+        let snap = app.snapshot.as_ref().expect("snapshot should be present");
+        assert_eq!(snap.focused_id, 2);
+        match &snap.root {
+            SnapshotNode::Tabs { active, .. } => assert_eq!(*active, 1),
+            other => panic!("expected Tabs node, got {other:?}"),
+        }
+
+        drop(app);
+        server.join().unwrap();
+    }
 
     #[test]
     fn parses_cell_size_response() {

@@ -170,7 +170,7 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
-    fn from_stream(
+    pub(crate) fn from_stream(
         stream: EncryptedStream,
         tunnel: Option<Child>,
         ssh_control_dir: Option<PathBuf>,
