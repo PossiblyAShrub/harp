@@ -47,8 +47,10 @@ use ratatui::{
     prelude::Buffer,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Clear, Paragraph, Widget},
 };
+
+use crate::keybinds::{Binding, MANAGING_BINDS, build_which_key_lines};
 use tui_term::{
     vt100::{self, MouseProtocolEncoding, MouseProtocolMode},
     widget::PseudoTerminal,
@@ -67,6 +69,8 @@ pub struct ProjectionStatus {
     mode: Mode,
     error: Option<String>,
     scope_name: Option<String>,
+    chord_breadcrumbs: Vec<&'static str>,
+    active_bindings: &'static [Binding],
 }
 
 impl ProjectionStatus {
@@ -75,6 +79,8 @@ impl ProjectionStatus {
             mode,
             error: None,
             scope_name: None,
+            chord_breadcrumbs: Vec::new(),
+            active_bindings: MANAGING_BINDS,
         }
     }
 
@@ -89,20 +95,45 @@ impl ProjectionStatus {
     pub fn set_scope_name(&mut self, scope_name: Option<String>) {
         self.scope_name = scope_name;
     }
+
+    pub fn set_chord(&mut self, breadcrumbs: Vec<&'static str>, bindings: &'static [Binding]) {
+        self.chord_breadcrumbs = breadcrumbs;
+        self.active_bindings = bindings;
+    }
+
+    /// Number of terminal rows needed to render the status / which-key bar at `width`.
+    pub fn height(&self, width: u16) -> u16 {
+        if self.error.is_some() || self.mode == Mode::Interacting {
+            return 1;
+        }
+        let rows = build_which_key_lines(self.active_bindings, width).len();
+        1 + rows.max(1) as u16
+    }
 }
 
 impl Widget for &ProjectionStatus {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        Clear.render(area, buf);
+
         let scope_label = self.scope_name.as_deref().map(|name| format!(" {name} "));
         let right_width = scope_label
             .as_ref()
             .map_or(0, |s| s.chars().count().min(area.width as usize) as u16);
 
-        let chunks = Layout::new(
+        let v_chunks = Layout::new(
+            Direction::Vertical,
+            [Constraint::Length(1), Constraint::Min(0)],
+        )
+        .split(area);
+
+        let header_chunks = Layout::new(
             Direction::Horizontal,
             [Constraint::Min(0), Constraint::Length(right_width)],
         )
-        .split(area);
+        .split(v_chunks[0]);
 
         if let Some(err) = &self.error {
             let line = Line::from(vec![
@@ -115,33 +146,62 @@ impl Widget for &ProjectionStatus {
                 ),
                 Span::styled(format!(" {err}"), Style::default().fg(Color::Red)),
             ]);
-            Paragraph::new(line).render(chunks[0], buf);
+            Paragraph::new(line).render(header_chunks[0], buf);
         } else {
-            let (badge, badge_style, hint) = match self.mode {
-                Mode::Interacting => (
-                    " INTERACTING ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                    " Ctrl+Space: manage | App keys pass through",
-                ),
-                Mode::Managing => (
-                    " MANAGING ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                    " c: copy selection | v: paste | Enter: interact | Arrows: focus | Ctrl+Arrows: split | Shift+Arrows: projection | Alt+Arrows: tabs | Ctrl+Alt+Arrows: move | drag top border or tab | Shift+drop: tab | t/Shift+t: new tab | s: scopes | r: rename | q q: close | d: detach",
-                ),
-            };
+            match self.mode {
+                Mode::Interacting => {
+                    let line = Line::from(vec![
+                        Span::styled(
+                            " INTERACTING ",
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Green)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            " Ctrl+Space: manage | App keys pass through",
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]);
+                    Paragraph::new(line).render(header_chunks[0], buf);
+                }
+                Mode::Managing => {
+                    let mut spans = vec![Span::styled(
+                        " MANAGING ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )];
+                    if self.chord_breadcrumbs.is_empty() {
+                        spans.push(Span::styled(
+                            " drag border/tab · Shift+drop: tab",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    } else {
+                        for crumb in &self.chord_breadcrumbs {
+                            spans.push(Span::styled(" › ", Style::default().fg(Color::DarkGray)));
+                            spans.push(Span::styled(
+                                *crumb,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        spans.push(Span::styled(
+                            "  Esc: cancel · Backspace: back",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    Paragraph::new(Line::from(spans)).render(header_chunks[0], buf);
 
-            let line = Line::from(vec![
-                Span::styled(badge, badge_style),
-                Span::styled(hint, Style::default().fg(Color::Gray)),
-            ]);
-
-            Paragraph::new(line).render(chunks[0], buf);
+                    if v_chunks[1].height > 0 {
+                        let which_key_lines =
+                            build_which_key_lines(self.active_bindings, area.width);
+                        Paragraph::new(which_key_lines).render(v_chunks[1], buf);
+                    }
+                }
+            }
         }
 
         if let Some(label) = scope_label {
@@ -152,7 +212,7 @@ impl Widget for &ProjectionStatus {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ))
-            .render(chunks[1], buf);
+            .render(header_chunks[1], buf);
         }
     }
 }

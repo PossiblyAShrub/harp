@@ -30,6 +30,7 @@ mod copymode;
 mod crypto;
 mod debug;
 mod drag;
+mod keybinds;
 mod picker;
 mod projections;
 mod protocol;
@@ -40,10 +41,11 @@ mod view;
 
 use copymode::{CopyAction, CopyMode};
 use drag::Drag;
+use keybinds::{Action, KeyOutcome, KeybindState};
 use picker::{PickerAction, ScopePicker};
 use projections::{Mode, ProjectionStatus, SCROLLBACK_LINES};
 use protocol::{
-    ClientMsg, HostInfo, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode, TabDir,
+    ClientMsg, HostInfo, NavDir, RemoteScopeSpec, ScopeSnapshot, ServerMsg, SnapshotNode,
 };
 use scopes::NavDirection;
 use switcher::{RenameAction, RenameModal, ScopeSwitcher, SwitcherAction};
@@ -83,7 +85,7 @@ struct App {
     scroll: HashMap<usize, usize>,
     /// Previous local left click, used to recognize a double-click.
     last_click: Option<(Instant, usize, u16, u16)>,
-    pending_q: Option<Instant>,
+    keybinds: KeybindState,
     exit: bool,
 }
 
@@ -132,7 +134,7 @@ impl App {
             drag: None,
             scroll: HashMap::new(),
             last_click: None,
-            pending_q: None,
+            keybinds: KeybindState::new(),
             exit: false,
         };
         app.client.send(&ClientMsg::ListScopes)?;
@@ -229,11 +231,19 @@ impl App {
 
     fn set_mode(&mut self, mode: Mode) {
         self.cancel_drag();
-        if mode != Mode::Managing {
-            self.flush_pending_q();
-        }
+        self.reset_keybinds();
         self.mode = mode;
         self.status.set_mode(mode);
+    }
+
+    fn reset_keybinds(&mut self) {
+        self.keybinds.reset();
+        self.sync_status_chord();
+    }
+
+    fn sync_status_chord(&mut self) {
+        self.status
+            .set_chord(self.keybinds.breadcrumbs(), self.keybinds.current_bindings());
     }
 
     fn cancel_drag(&mut self) {
@@ -859,16 +869,12 @@ impl App {
 
         while !self.exit {
             self.process_background()?;
-            self.flush_expired_q();
             if self.exit {
                 break;
             }
             terminal.draw(|frame| self.render(frame))?;
 
-            let wait = if self.pending_q.is_some()
-                || !self.connecting_hosts.is_empty()
-                || self.askpass_prompt.is_some()
-            {
+            let wait = if !self.connecting_hosts.is_empty() || self.askpass_prompt.is_some() {
                 Duration::from_millis(25)
             } else {
                 Duration::from_millis(250)
@@ -903,39 +909,48 @@ impl App {
         Ok(())
     }
 
-    fn handle_q_gesture(&mut self, event: &Event) -> io::Result<bool> {
-        const DOUBLE_Q_WINDOW: Duration = Duration::from_millis(400);
-        let is_q_press = matches!(event, Event::Key(key)
-            if key.code == KeyCode::Char('q')
-                && key.modifiers == KeyModifiers::NONE
-                && key.kind == KeyEventKind::Press);
-        let is_q_repeat = matches!(event, Event::Key(key)
-            if key.code == KeyCode::Char('q')
-                && key.modifiers == KeyModifiers::NONE
-                && key.kind == KeyEventKind::Repeat);
-        let is_q_release = matches!(event, Event::Key(key)
-            if key.code == KeyCode::Char('q')
-                && key.modifiers == KeyModifiers::NONE
-                && key.kind == KeyEventKind::Release);
-        let can_close = self.mode == Mode::Managing
-            && self.snapshot.is_some()
-            && self.picker.is_none()
-            && self.switcher.is_none()
-            && self.rename.is_none()
-            && self.copy_mode.is_none();
-
-        if !can_close {
-            self.flush_pending_q();
-            return Ok(false);
-        }
-
-        if let Some(started) = self.pending_q {
-            if is_q_repeat || is_q_release {
-                return Ok(true);
+    fn execute_managing_action(&mut self, action: Action) -> io::Result<()> {
+        match action {
+            Action::Interact => self.set_mode(Mode::Interacting),
+            Action::Focus(dir) => {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::MoveFocus {
+                        scope_id: snap.scope_id,
+                        dir: to_nav_dir(dir),
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
             }
-            if is_q_press && started.elapsed() <= DOUBLE_Q_WINDOW {
-                self.pending_q = None;
-                self.status.set_error(None);
+            Action::SplitZsh(dir) => {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::Split {
+                        scope_id: snap.scope_id,
+                        dir: to_nav_dir(dir),
+                        spec: RemoteScopeSpec {
+                            machine: "localhost".to_string(),
+                            cwd: self.default_cwd.clone(),
+                            program: "zsh".to_string(),
+                        },
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+            }
+            Action::SplitPicker(dir) => {
+                self.picker = Some(ScopePicker::new(dir, self.default_cwd.clone()));
+            }
+            Action::MoveProjection(dir) => {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::MoveProjection {
+                        scope_id: snap.scope_id,
+                        dir: to_nav_dir(dir),
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+            }
+            Action::CloseProjection => {
                 if let Some(snap) = &self.snapshot {
                     let scope_id = snap.scope_id;
                     let projection_id = snap.focused_id;
@@ -946,33 +961,74 @@ impl App {
                     let reply = self.client.recv::<ServerMsg>()?;
                     self.handle_server_reply(reply)?;
                 }
-                return Ok(true);
             }
-            self.flush_pending_q();
+            Action::NewTabZsh => {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::NewTab {
+                        scope_id: snap.scope_id,
+                        spec: RemoteScopeSpec {
+                            machine: "localhost".to_string(),
+                            cwd: self.default_cwd.clone(),
+                            program: "zsh".to_string(),
+                        },
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+            }
+            Action::NewTabPicker => {
+                self.picker = Some(ScopePicker::for_tab(self.default_cwd.clone()));
+            }
+            Action::SwitchTab(tab_dir) => {
+                if let Some(snap) = &self.snapshot {
+                    self.client.send(&ClientMsg::SwitchTab {
+                        scope_id: snap.scope_id,
+                        dir: tab_dir,
+                    })?;
+                    let reply = self.client.recv::<ServerMsg>()?;
+                    self.handle_server_reply(reply)?;
+                }
+            }
+            Action::OpenSwitcher => {
+                self.open_switcher(true)?;
+            }
+            Action::RenameScope => {
+                if let Some(snap) = &self.snapshot {
+                    self.rename = Some(PendingRename {
+                        scope_id: snap.scope_id,
+                        modal: RenameModal::new(snap.scope_name.clone()),
+                    });
+                }
+            }
+            Action::Detach => {
+                self.exit = true;
+            }
+            Action::Paste => {
+                self.paste_from_clipboard()?;
+            }
+            Action::CopySelection => {
+                if let Some(selection) = &self.copy_mode
+                    && selection.has_selection()
+                {
+                    clipboard::clipboard_set(&selection.copy_text());
+                }
+            }
+            Action::ScrollPage(dir) => {
+                if let Some(id) = self.snapshot.as_ref().map(|s| s.focused_id) {
+                    if self.pane_in_alternate_screen(id) {
+                        let code = if dir > 0 {
+                            KeyCode::PageUp
+                        } else {
+                            KeyCode::PageDown
+                        };
+                        self.forward_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))?;
+                    } else {
+                        self.scroll_pane_page(id, dir.into());
+                    }
+                }
+            }
         }
-
-        if is_q_press {
-            self.pending_q = Some(Instant::now());
-            self.status
-                .set_error(Some("Press q again to close projection".to_string()));
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn flush_pending_q(&mut self) {
-        if self.pending_q.take().is_some() {
-            self.status.set_error(None);
-        }
-    }
-
-    fn flush_expired_q(&mut self) {
-        if self
-            .pending_q
-            .is_some_and(|started| started.elapsed() >= Duration::from_millis(400))
-        {
-            self.flush_pending_q();
-        }
+        Ok(())
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -1027,11 +1083,7 @@ impl App {
             if reopen_askpass {
                 self.askpass_visible = true;
                 self.status.set_error(None);
-            } else if suppress_mouse
-                || (self.host_prompt.is_none()
-                    && !self.askpass_visible
-                    && self.handle_q_gesture(&event)?)
-            {
+            } else if suppress_mouse {
                 if self.exit {
                     break;
                 }
@@ -1360,7 +1412,7 @@ impl App {
                                 } else {
                                     -1
                                 };
-                                self.scroll_pane_page(id, dir);
+                                self.scroll_pane_page(id, dir.into());
                             }
                         }
                         _ => {
@@ -1382,129 +1434,24 @@ impl App {
                     Mode::Managing => match &event {
                         Event::Paste(_) => self.forward_event(event)?,
                         Event::Key(key_event)
-                            if key_event.kind == KeyEventKind::Press
-                                && key_event.code == KeyCode::Char('v')
-                                && key_event.modifiers == KeyModifiers::NONE =>
-                        {
-                            self.paste_from_clipboard()?;
-                        }
-                        Event::Key(key_event)
                             if matches!(
                                 key_event.kind,
                                 KeyEventKind::Press | KeyEventKind::Repeat
                             ) =>
                         {
                             self.status.set_error(None);
-                            if matches!(key_event.code, KeyCode::PageUp | KeyCode::PageDown)
-                                && key_event.modifiers == KeyModifiers::NONE
-                            {
-                                let focused = self.snapshot.as_ref().map(|s| s.focused_id);
-                                if let Some(id) = focused {
-                                    if self.pane_in_alternate_screen(id) {
-                                        self.forward_event(event)?;
-                                    } else {
-                                        let dir = if key_event.code == KeyCode::PageUp {
-                                            1
-                                        } else {
-                                            -1
-                                        };
-                                        self.scroll_pane_page(id, dir);
-                                    }
+                            match self.keybinds.handle_key(*key_event) {
+                                KeyOutcome::Execute(action) => {
+                                    self.sync_status_chord();
+                                    self.execute_managing_action(action)?;
                                 }
-                            } else if key_event.code == KeyCode::Enter
-                                && !key_event
-                                    .modifiers
-                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                            {
-                                self.set_mode(Mode::Interacting);
-                            } else if key_event.code == KeyCode::Char('d')
-                                && key_event.modifiers == KeyModifiers::NONE
-                            {
-                                self.exit = true;
-                            } else if key_event.code == KeyCode::Char('s')
-                                && key_event.modifiers == KeyModifiers::NONE
-                            {
-                                self.open_switcher(true)?;
-                            } else if key_event.code == KeyCode::Char('r')
-                                && key_event.modifiers == KeyModifiers::NONE
-                            {
-                                if let Some(snap) = &self.snapshot {
-                                    self.rename = Some(PendingRename {
-                                        scope_id: snap.scope_id,
-                                        modal: RenameModal::new(snap.scope_name.clone()),
-                                    });
+                                KeyOutcome::EnteredGroup
+                                | KeyOutcome::SteppedBack
+                                | KeyOutcome::Cancelled
+                                | KeyOutcome::Unbound => {
+                                    self.sync_status_chord();
                                 }
-                            } else if key_event.code == KeyCode::Char('T')
-                                && !key_event
-                                    .modifiers
-                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                            {
-                                self.picker = Some(ScopePicker::for_tab(self.default_cwd.clone()));
-                            } else if key_event.code == KeyCode::Char('t')
-                                && key_event.modifiers == KeyModifiers::NONE
-                            {
-                                if let Some(snap) = &self.snapshot {
-                                    self.client.send(&ClientMsg::NewTab {
-                                        scope_id: snap.scope_id,
-                                        spec: RemoteScopeSpec {
-                                            machine: "localhost".to_string(),
-                                            cwd: self.default_cwd.clone(),
-                                            program: "zsh".to_string(),
-                                        },
-                                    })?;
-                                    let reply = self.client.recv::<ServerMsg>()?;
-                                    self.handle_server_reply(reply)?;
-                                }
-                            } else if let Some(dir) = arrow_direction(key_event.code) {
-                                if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                                    && key_event.modifiers.contains(KeyModifiers::ALT)
-                                {
-                                    if let Some(snap) = &self.snapshot {
-                                        self.client.send(&ClientMsg::MoveProjection {
-                                            scope_id: snap.scope_id,
-                                            dir: to_nav_dir(dir),
-                                        })?;
-                                        let reply = self.client.recv::<ServerMsg>()?;
-                                        self.handle_server_reply(reply)?;
-                                    }
-                                } else if key_event.modifiers.contains(KeyModifiers::ALT) {
-                                    if let Some(snap) = &self.snapshot {
-                                        let tab_dir = match dir {
-                                            NavDirection::Left | NavDirection::Up => TabDir::Prev,
-                                            NavDirection::Right | NavDirection::Down => {
-                                                TabDir::Next
-                                            }
-                                        };
-                                        self.client.send(&ClientMsg::SwitchTab {
-                                            scope_id: snap.scope_id,
-                                            dir: tab_dir,
-                                        })?;
-                                        let reply = self.client.recv::<ServerMsg>()?;
-                                        self.handle_server_reply(reply)?;
-                                    }
-                                } else if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                                    self.picker =
-                                        Some(ScopePicker::new(dir, self.default_cwd.clone()));
-                                } else if let Some(snap) = &self.snapshot {
-                                    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                        self.client.send(&ClientMsg::Split {
-                                            scope_id: snap.scope_id,
-                                            dir: to_nav_dir(dir),
-                                            spec: RemoteScopeSpec {
-                                                machine: "localhost".to_string(),
-                                                cwd: self.default_cwd.clone(),
-                                                program: "zsh".to_string(),
-                                            },
-                                        })?;
-                                    } else {
-                                        self.client.send(&ClientMsg::MoveFocus {
-                                            scope_id: snap.scope_id,
-                                            dir: to_nav_dir(dir),
-                                        })?;
-                                    }
-                                    let reply = self.client.recv::<ServerMsg>()?;
-                                    self.handle_server_reply(reply)?;
-                                }
+                                KeyOutcome::Unhandled => {}
                             }
                         }
                         Event::Mouse(mouse_event)
@@ -1531,9 +1478,13 @@ impl App {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let status_height = self
+            .status
+            .height(area.width)
+            .min(area.height.saturating_sub(1).max(1));
         let chunks = Layout::new(
             Direction::Vertical,
-            [Constraint::Fill(1), Constraint::Length(1)],
+            [Constraint::Fill(1), Constraint::Length(status_height)],
         )
         .split(area);
 
@@ -1701,16 +1652,6 @@ fn parse_num(bytes: &[u8]) -> Option<u16> {
         return None;
     }
     std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-fn arrow_direction(code: KeyCode) -> Option<NavDirection> {
-    match code {
-        KeyCode::Up => Some(NavDirection::Up),
-        KeyCode::Down => Some(NavDirection::Down),
-        KeyCode::Left => Some(NavDirection::Left),
-        KeyCode::Right => Some(NavDirection::Right),
-        _ => None,
-    }
 }
 
 fn to_nav_dir(dir: NavDirection) -> NavDir {

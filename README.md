@@ -69,7 +69,7 @@ A scope is a collection of "projections". A scope lives on a local
 machine or a remote machine. You can switch scopes within a session, or quit
 your client while a scope continues in the background.
 
-Open the scope switcher with `s` and choose **Add SSH Host** to connect another
+Open the scope switcher with `s s` and choose **Add SSH Host** to connect another
 Harp node. Harp saves peer hosts in the local server's `~/.config/harp/peers.json`
 catalog. The switcher lists scopes from each connected host and offers a
 per-host **New Scope** entry. Remote scopes keep running on their owner node
@@ -88,7 +88,7 @@ Drop near an edge to split in that direction, or over a tab label to insert
 before or after it. Dropping in the center swaps projections or merges a
 whole stack into the destination's tabs. Hold Shift to add as tabs from
 anywhere in the destination. Press Esc to cancel a drag, or use
-`Ctrl+Alt+Arrow` to swap the focused projection with its neighbor.
+`p m` followed by an arrow key to swap the focused projection with its neighbor.
 
 ### `.harp` Configuration
 
