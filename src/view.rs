@@ -9,31 +9,18 @@ use ratatui::{
 };
 use tui_term::{vt100, widget::PseudoTerminal};
 
-use crate::{
-    debug::{DebugLogProjection, ServerDebugProjection},
-    protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir, TabPageSnapshot},
-    server::ServerTraceEntry,
-};
+use crate::protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir, TabPageSnapshot};
 
 /// Renders a [`ScopeSnapshot`] as a tree of tile nodes. The snapshot's root is
 /// rendered by the exact same code path as every other node.
 pub struct SnapshotView<'a> {
     snap: &'a ScopeSnapshot,
     parsers: &'a HashMap<usize, vt100::Parser>,
-    trace: &'a [ServerTraceEntry],
 }
 
 impl<'a> SnapshotView<'a> {
-    pub fn new(
-        snap: &'a ScopeSnapshot,
-        parsers: &'a HashMap<usize, vt100::Parser>,
-        trace: &'a [ServerTraceEntry],
-    ) -> Self {
-        Self {
-            snap,
-            parsers,
-            trace,
-        }
+    pub fn new(snap: &'a ScopeSnapshot, parsers: &'a HashMap<usize, vt100::Parser>) -> Self {
+        Self { snap, parsers }
     }
 
     fn render_node(&self, node: &SnapshotNode, area: Rect, buf: &mut Buffer) {
@@ -50,12 +37,6 @@ impl<'a> SnapshotView<'a> {
                 if let Some(parser) = self.parsers.get(id) {
                     PseudoTerminal::new(parser.screen()).render(inner, buf);
                 }
-            }
-            SnapshotNode::Debug { .. } => {
-                ServerDebugProjection::new(self.trace).render(area, buf);
-            }
-            SnapshotNode::DebugLog { .. } => {
-                DebugLogProjection::new(&self.snap.debug_log).render(area, buf);
             }
             SnapshotNode::Split {
                 direction,
@@ -79,14 +60,10 @@ impl<'a> SnapshotView<'a> {
                 let inner = block.inner(area);
                 block.render(area, buf);
 
-                if let Some(page) = pages.get(*active) {
-                    if page.is_debug {
-                        ServerDebugProjection::new(self.trace).render(inner, buf);
-                    } else if page.is_debug_log {
-                        DebugLogProjection::new(&self.snap.debug_log).render(inner, buf);
-                    } else if let Some(parser) = self.parsers.get(&page.id) {
-                        PseudoTerminal::new(parser.screen()).render(inner, buf);
-                    }
+                if let Some(page) = pages.get(*active)
+                    && let Some(parser) = self.parsers.get(&page.id)
+                {
+                    PseudoTerminal::new(parser.screen()).render(inner, buf);
                 }
             }
         }
@@ -155,9 +132,7 @@ fn find_pane<T>(
 
 fn active_id(node: &SnapshotNode) -> Option<usize> {
     match node {
-        SnapshotNode::Leaf { id, .. }
-        | SnapshotNode::Debug { id }
-        | SnapshotNode::DebugLog { id } => Some(*id),
+        SnapshotNode::Leaf { id, .. } => Some(*id),
         SnapshotNode::Tabs { pages, active } => pages.get(*active).map(|page| page.id),
         SnapshotNode::Split { .. } => None,
     }
@@ -341,8 +316,6 @@ mod tests {
                     state: Vec::new(),
                     scrollback: Vec::new(),
                     alternate_screen: false,
-                    is_debug: false,
-                    is_debug_log: false,
                 },
                 TabPageSnapshot {
                     id: 2,
@@ -352,8 +325,6 @@ mod tests {
                     state: Vec::new(),
                     scrollback: Vec::new(),
                     alternate_screen: false,
-                    is_debug: false,
-                    is_debug_log: false,
                 },
             ],
             active: 1,
@@ -379,12 +350,11 @@ mod tests {
                 alternate_screen: false,
             },
             passthrough: String::new(),
-            debug_log: Vec::new(),
         };
         let parsers = HashMap::new();
         let area = Rect::new(0, 0, 30, 10);
         let mut buf = Buffer::empty(area);
-        SnapshotView::new(&snap, &parsers, &[]).render(area, &mut buf);
+        SnapshotView::new(&snap, &parsers).render(area, &mut buf);
         let top_row: String = (0..30).map(|x| buf[(x, 0)].symbol()).collect();
         assert!(
             top_row.contains(" nvim src/main.rs "),

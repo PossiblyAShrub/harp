@@ -3,8 +3,6 @@ use std::path::PathBuf;
 use crossterm::event::Event;
 use serde::{Deserialize, Serialize};
 
-pub const DEBUG_PROJECTION_PROGRAM: &str = "__harp_server_debug__";
-pub const DEBUG_LOG_PROJECTION_PROGRAM: &str = "__harp_debug_log__";
 pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,10 +85,6 @@ pub struct TabPageSnapshot {
     pub scrollback: Vec<u8>,
     /// Whether the application is using the alternate screen buffer.
     pub alternate_screen: bool,
-    #[serde(default)]
-    pub is_debug: bool,
-    #[serde(default)]
-    pub is_debug_log: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,12 +105,6 @@ pub enum SnapshotNode {
         scrollback: Vec<u8>,
         /// Whether the application is using the alternate screen buffer.
         alternate_screen: bool,
-    },
-    Debug {
-        id: usize,
-    },
-    DebugLog {
-        id: usize,
     },
     Split {
         direction: SplitDir,
@@ -140,8 +128,6 @@ pub struct ScopeSnapshot {
     /// Always ASCII (base64 payloads), so a `String` keeps the JSON framing
     /// compact instead of one array entry per byte.
     pub passthrough: String,
-    #[serde(default)]
-    pub debug_log: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

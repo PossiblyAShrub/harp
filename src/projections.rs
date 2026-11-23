@@ -157,6 +157,31 @@ impl Widget for &ProjectionStatus {
     }
 }
 
+pub trait ProjectionProgram: Sync {
+    fn label(&self) -> &str;
+    fn program(&self) -> &str;
+    fn launch(&self, cols: u16, rows: u16, cwd: &Path) -> Result<ProjectionTerm>;
+}
+
+pub struct CommandProgram<'a> {
+    pub label: &'a str,
+    pub program: &'a str,
+}
+
+impl ProjectionProgram for CommandProgram<'_> {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn program(&self) -> &str {
+        self.program
+    }
+
+    fn launch(&self, cols: u16, rows: u16, cwd: &Path) -> Result<ProjectionTerm> {
+        ProjectionTerm::with_command(cols, rows, self.program, cwd)
+    }
+}
+
 #[derive(Default)]
 struct TitleCallbacks {
     window_title: Option<String>,
@@ -193,8 +218,9 @@ fn sanitize_title(bytes: &[u8]) -> Option<String> {
 }
 
 pub struct ProjectionTerm {
-    master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    closed: Arc<AtomicBool>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     parser: Arc<Mutex<vt100::Parser<TitleCallbacks>>>,
     exited: Arc<AtomicBool>,
@@ -213,9 +239,11 @@ pub struct ProjectionTerm {
 
 impl Drop for ProjectionTerm {
     fn drop(&mut self) {
-        // Dropping the pty writer sends EOF to the child, which lets the
-        // reader thread's blocking read return and the child be reaped.
+        // Signal any in-process builtin and drop the writer to send EOF,
+        // letting the reader thread's blocking read return.
+        self.closed.store(true, Ordering::Release);
         *self.writer.lock().unwrap() = None;
+        wake_watchers();
     }
 }
 
@@ -250,7 +278,55 @@ impl ProjectionTerm {
         let mut child = pty.slave.spawn_command(cmd)?;
         crate::debug::log_debug_event(format!("started projection: {program}"));
         let killer = child.clone_killer();
+        let reader = pty.master.try_clone_reader()?;
+        let writer = pty.master.take_writer()?;
 
+        Self::from_io(
+            reader,
+            writer,
+            Some(pty.master),
+            Some(killer),
+            cols,
+            rows,
+            program,
+            move || {
+                let _ = child.wait();
+            },
+        )
+    }
+
+    /// Creates an in-process projection connected to the other end of a
+    /// bidirectional stream instead of spawning an external child process.
+    pub fn with_builtin(
+        cols: u16,
+        rows: u16,
+        name: &str,
+        run: impl FnOnce(std::os::unix::net::UnixStream, &AtomicBool) + Send + 'static,
+    ) -> Result<Self> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let (term_side, builtin_side) = std::os::unix::net::UnixStream::pair()?;
+        let reader = Box::new(term_side.try_clone()?);
+        let writer = Box::new(term_side);
+        let term = Self::from_io(reader, writer, None, None, cols, rows, name, || {})?;
+        let closed = Arc::clone(&term.closed);
+        thread::spawn(move || {
+            run(builtin_side, &closed);
+        });
+        Ok(term)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_io(
+        mut reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        master: Option<Box<dyn MasterPty + Send>>,
+        killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+        cols: u16,
+        rows: u16,
+        program: &str,
+        on_eof: impl FnOnce() + Send + 'static,
+    ) -> Result<Self> {
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
@@ -258,10 +334,10 @@ impl ProjectionTerm {
             TitleCallbacks::default(),
         )));
         let exited = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let revision = Arc::new(AtomicU64::new(1));
 
-        let mut reader = pty.master.try_clone_reader()?;
-        let writer = Arc::new(Mutex::new(Some(pty.master.take_writer()?)));
+        let writer = Arc::new(Mutex::new(Some(writer)));
         let cell_px = Arc::new(Mutex::new((0u16, 0u16)));
         let passthrough = Arc::new(Mutex::new(Vec::new()));
         let parser_clone = Arc::clone(&parser);
@@ -335,15 +411,16 @@ impl ProjectionTerm {
                 wake_watchers();
             }
 
-            let _ = child.wait();
+            on_eof();
             exited_clone.store(true, Ordering::Release);
             revision_clone.fetch_add(1, Ordering::Release);
             wake_watchers();
         });
 
         Ok(Self {
-            master: pty.master,
+            master,
             killer,
+            closed,
             writer,
             parser,
             exited,
@@ -411,8 +488,12 @@ impl ProjectionTerm {
     }
 
     pub fn force_close(&mut self) {
-        let _ = self.killer.kill();
+        self.closed.store(true, Ordering::Release);
+        if let Some(killer) = &mut self.killer {
+            let _ = killer.kill();
+        }
         *self.writer.lock().unwrap() = None;
+        wake_watchers();
     }
 
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> io::Result<()> {
@@ -472,9 +553,12 @@ impl ProjectionTerm {
     }
 
     fn apply_pixel_size(&mut self) -> io::Result<()> {
+        let Some(master) = &self.master else {
+            return Ok(());
+        };
         let (cols, rows) = self.size;
         let (cell_w, cell_h) = *self.cell_px.lock().unwrap();
-        self.master
+        master
             .resize(PtySize {
                 rows,
                 cols,
@@ -503,15 +587,17 @@ impl ProjectionTerm {
             .unwrap()
             .screen_mut()
             .set_size(rows, cols);
-        let (cell_w, cell_h) = *self.cell_px.lock().unwrap();
-        self.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: cell_w.saturating_mul(cols),
-                pixel_height: cell_h.saturating_mul(rows),
-            })
-            .map_err(io::Error::other)?;
+        if let Some(master) = &self.master {
+            let (cell_w, cell_h) = *self.cell_px.lock().unwrap();
+            master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: cell_w.saturating_mul(cols),
+                    pixel_height: cell_h.saturating_mul(rows),
+                })
+                .map_err(io::Error::other)?;
+        }
         self.size = (cols, rows);
         self.revision.fetch_add(1, Ordering::Release);
 
@@ -1923,5 +2009,23 @@ printf 'RESP:%s\n' "$r"
         assert_eq!(term.title(), "custom-pane-title");
 
         let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn builtin_projection_streams_output_and_sets_osc_title() {
+        let term = ProjectionTerm::with_builtin(40, 10, "Builtin", |mut stream, _closed| {
+            let _ = stream.write_all(b"\x1b]2;Debug Log\x07hello builtin\r\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(200));
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(term.title(), "Debug Log");
+
+        let (_, _, state, _, _) = term.state_snapshot();
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process(&state);
+        assert!(parser.screen().contents().contains("hello builtin"));
     }
 }

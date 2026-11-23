@@ -250,7 +250,6 @@ mod tests {
             focused_id: 1,
             revision: 0,
             passthrough: String::new(),
-            debug_log: Vec::new(),
             root: SnapshotNode::Tabs {
                 pages: ["終端", "two"]
                     .into_iter()
@@ -263,8 +262,6 @@ mod tests {
                         state: Vec::new(),
                         scrollback: Vec::new(),
                         alternate_screen: false,
-                        is_debug: true,
-                        is_debug_log: false,
                     })
                     .collect(),
                 active: 0,

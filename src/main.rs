@@ -346,7 +346,6 @@ impl App {
                 active_ids.push(*id);
                 self.upsert_parser(*id, *cols, *rows, state, scrollback);
             }
-            SnapshotNode::Debug { .. } | SnapshotNode::DebugLog { .. } => {}
             SnapshotNode::Split { children, .. } => {
                 for child in children {
                     self.sync_parsers(&child.node, active_ids);
@@ -354,16 +353,14 @@ impl App {
             }
             SnapshotNode::Tabs { pages, .. } => {
                 for page in pages {
-                    if !page.is_debug && !page.is_debug_log {
-                        active_ids.push(page.id);
-                        self.upsert_parser(
-                            page.id,
-                            page.cols,
-                            page.rows,
-                            &page.state,
-                            &page.scrollback,
-                        );
-                    }
+                    active_ids.push(page.id);
+                    self.upsert_parser(
+                        page.id,
+                        page.cols,
+                        page.rows,
+                        &page.state,
+                        &page.scrollback,
+                    );
                 }
             }
         }
@@ -1476,8 +1473,7 @@ impl Widget for &App {
         .split(area);
 
         if let Some(snap) = &self.snapshot {
-            let trace = self.client.debug_trace();
-            SnapshotView::new(snap, &self.parsers, &trace).render(chunks[0], buf);
+            SnapshotView::new(snap, &self.parsers).render(chunks[0], buf);
         }
         self.status.render(chunks[1], buf);
         if let (Some(drag), Some(snap)) = (&self.drag, &self.snapshot) {
@@ -1553,7 +1549,6 @@ fn snapshot_alternate_screen(node: &SnapshotNode, id: usize) -> Option<bool> {
             alternate_screen,
             ..
         } => (*leaf_id == id).then_some(*alternate_screen),
-        SnapshotNode::Debug { .. } | SnapshotNode::DebugLog { .. } => None,
         SnapshotNode::Split { children, .. } => children
             .iter()
             .find_map(|child| snapshot_alternate_screen(&child.node, id)),
@@ -1971,7 +1966,6 @@ echo E2E_DONE
     fn root_has_leaf_state(root: &SnapshotNode, pred: &dyn Fn(&str) -> bool) -> bool {
         match root {
             SnapshotNode::Leaf { state, .. } => pred(&String::from_utf8_lossy(state)),
-            SnapshotNode::Debug { .. } | SnapshotNode::DebugLog { .. } => false,
             SnapshotNode::Split { children, .. } => {
                 children.iter().any(|c| root_has_leaf_state(&c.node, pred))
             }
@@ -1987,7 +1981,6 @@ echo E2E_DONE
             SnapshotNode::Leaf { state, .. } => {
                 out.push(String::from_utf8_lossy(state).into_owned());
             }
-            SnapshotNode::Debug { .. } | SnapshotNode::DebugLog { .. } => {}
             SnapshotNode::Split { children, .. } => {
                 for c in children {
                     dump_leaf_states(out, &c.node);
@@ -2005,7 +1998,6 @@ echo E2E_DONE
     fn root_has_raw_state(root: &SnapshotNode, pred: &dyn Fn(&[u8]) -> bool) -> bool {
         match root {
             SnapshotNode::Leaf { state, .. } => pred(state),
-            SnapshotNode::Debug { .. } | SnapshotNode::DebugLog { .. } => false,
             SnapshotNode::Split { children, .. } => {
                 children.iter().any(|c| root_has_raw_state(&c.node, pred))
             }

@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -165,15 +164,6 @@ pub struct ClientConnection {
     cell_px: Option<(u16, u16)>,
     _tunnel: Option<Child>,
     _ssh_control_dir: Option<PathBuf>,
-    pending: VecDeque<(String, Instant)>,
-    trace: VecDeque<ServerTraceEntry>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ServerTraceEntry {
-    pub request: String,
-    pub response: String,
-    pub latency: Duration,
 }
 
 impl ClientConnection {
@@ -232,8 +222,6 @@ impl ClientConnection {
             cell_px: None,
             _tunnel: tunnel,
             _ssh_control_dir: ssh_control_dir,
-            pending: VecDeque::new(),
-            trace: VecDeque::new(),
         };
         conn.verify_version()?;
         Ok(conn)
@@ -299,7 +287,6 @@ impl ClientConnection {
     }
 
     pub fn send(&mut self, value: &ClientMsg) -> std::io::Result<()> {
-        let label = message_label(value);
         if let ClientMsg::SetPixelSize { cell_w, cell_h } = value {
             self.cell_px = Some((*cell_w, *cell_h));
         }
@@ -357,9 +344,6 @@ impl ClientConnection {
         }
 
         self.writer.send(value)?;
-        if !matches!(label.as_str(), "InputAsync" | "Subscribe") {
-            self.pending.push_back((label, Instant::now()));
-        }
         Ok(())
     }
 
@@ -403,24 +387,9 @@ impl ClientConnection {
             snapshot.scope_id =
                 (((index + 1) as u64) << 48) | (snapshot.scope_id & 0x0000_FFFF_FFFF_FFFF);
         }
-        let response = message_label(&msg);
         let value: T = serde_json::from_value(serde_json::to_value(msg).map_err(io::Error::other)?)
             .map_err(io::Error::other)?;
-        if let Some((request, started)) = self.pending.pop_front() {
-            self.trace.push_back(ServerTraceEntry {
-                request,
-                response,
-                latency: started.elapsed(),
-            });
-            while self.trace.len() > 500 {
-                self.trace.pop_front();
-            }
-        }
         Ok(value)
-    }
-
-    pub fn debug_trace(&self) -> Vec<ServerTraceEntry> {
-        self.trace.iter().cloned().collect()
     }
 
     pub fn add_peer_connection(
@@ -1078,12 +1047,21 @@ pub fn run_server(bind_addr: &str) -> Result<()> {
                             continue;
                         }
                         let reply_expected = !matches!(&msg, ClientMsg::InputAsync { .. });
+                        let req_label = format!("{msg:?}");
+                        let started = Instant::now();
                         let (reply, exit_after) = {
                             let mut guard = state.lock().unwrap();
                             let reply = guard.handle_msg(msg);
                             let exit_after = guard.should_exit();
                             (reply, exit_after)
                         };
+                        if reply_expected {
+                            crate::debug::log_server_trace(
+                                &req_label,
+                                &message_label(&reply),
+                                started.elapsed(),
+                            );
+                        }
                         if !reply_expected {
                             projections::wake_watchers();
                         }

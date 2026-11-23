@@ -12,10 +12,7 @@ use ratatui::{
 
 use crate::{
     projections::ProjectionTerm,
-    protocol::{
-        DEBUG_LOG_PROJECTION_PROGRAM, DEBUG_PROJECTION_PROGRAM, DropAction, ScopeSnapshot,
-        SnapshotChild, SnapshotNode, SplitDir,
-    },
+    protocol::{DropAction, ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,30 +53,17 @@ impl NavDirection {
     }
 }
 
-pub enum Projection {
-    Term(ProjectionTerm),
-    ServerDebug,
-    DebugLog,
-}
+pub struct Projection(ProjectionTerm);
 
 impl Projection {
     fn from_spec(spec: &ScopeSpec, cols: u16, rows: u16, cell_px: (u16, u16)) -> Result<Self> {
-        if spec.program == DEBUG_PROJECTION_PROGRAM {
-            return Ok(Projection::ServerDebug);
-        }
-        if spec.program == DEBUG_LOG_PROJECTION_PROGRAM {
-            return Ok(Projection::DebugLog);
-        }
-        let mut term = ProjectionTerm::with_command(cols, rows, &spec.program, &spec.cwd)?;
+        let mut term = crate::debug::launch_program(&spec.program, cols, rows, &spec.cwd)?;
         term.set_cell_size(cell_px.0, cell_px.1)?;
-        Ok(Projection::Term(term))
+        Ok(Self(term))
     }
 
     fn is_exited(&self) -> bool {
-        match self {
-            Projection::Term(term) => term.is_exited(),
-            Projection::ServerDebug | Projection::DebugLog => false,
-        }
+        self.0.is_exited()
     }
 
     fn needs_border(&self) -> bool {
@@ -87,62 +71,36 @@ impl Projection {
     }
 
     fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
-        match self {
-            Projection::Term(term) => term.set_cell_size(w, h),
-            Projection::ServerDebug | Projection::DebugLog => Ok(()),
-        }
+        self.0.set_cell_size(w, h)
     }
 
     fn take_passthrough(&mut self) -> Vec<u8> {
-        match self {
-            Projection::Term(term) => term.take_passthrough(),
-            Projection::ServerDebug | Projection::DebugLog => Vec::new(),
-        }
+        self.0.take_passthrough()
     }
 
     fn resize(&mut self, rect: Rect) -> io::Result<()> {
-        match self {
-            Projection::Term(term) => {
-                let inner = pane_inner(rect);
-                term.resize(inner.width, inner.height)
-            }
-            Projection::ServerDebug | Projection::DebugLog => Ok(()),
-        }
+        let inner = pane_inner(rect);
+        self.0.resize(inner.width, inner.height)
     }
 
     fn handle_event(&mut self, event: &Event) -> io::Result<()> {
-        match self {
-            Projection::Term(term) => term.handle_event(event),
-            Projection::ServerDebug | Projection::DebugLog => Ok(()),
-        }
+        self.0.handle_event(event)
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> io::Result<()> {
-        match self {
-            Projection::Term(term) => term.handle_mouse_event(mouse_event),
-            Projection::ServerDebug | Projection::DebugLog => Ok(()),
-        }
+        self.0.handle_mouse_event(mouse_event)
     }
 
     fn prune_exited(&mut self) -> io::Result<bool> {
-        match self {
-            Projection::Term(_) => Ok(false),
-            Projection::ServerDebug | Projection::DebugLog => Ok(false),
-        }
+        Ok(false)
     }
 
     fn revision(&self) -> u64 {
-        match self {
-            Projection::Term(term) => term.revision(),
-            Projection::ServerDebug => 0,
-            Projection::DebugLog => crate::debug::debug_log_revision(),
-        }
+        self.0.revision()
     }
 
     fn force_close(&mut self) {
-        if let Projection::Term(term) = self {
-            term.force_close();
-        }
+        self.0.force_close();
     }
 }
 
@@ -503,22 +461,19 @@ impl TileNode {
 
     fn to_snapshot(&self) -> Option<SnapshotNode> {
         match self {
-            TileNode::Leaf { id, projection } => match projection {
-                Projection::Term(term) => {
-                    let (cols, rows, state, scrollback, alternate_screen) = term.state_snapshot();
-                    Some(SnapshotNode::Leaf {
-                        id: *id,
-                        name: term.title(),
-                        cols,
-                        rows,
-                        state,
-                        scrollback,
-                        alternate_screen,
-                    })
-                }
-                Projection::ServerDebug => Some(SnapshotNode::Debug { id: *id }),
-                Projection::DebugLog => Some(SnapshotNode::DebugLog { id: *id }),
-            },
+            TileNode::Leaf { id, projection } => {
+                let (cols, rows, state, scrollback, alternate_screen) =
+                    projection.0.state_snapshot();
+                Some(SnapshotNode::Leaf {
+                    id: *id,
+                    name: projection.0.title(),
+                    cols,
+                    rows,
+                    state,
+                    scrollback,
+                    alternate_screen,
+                })
+            }
             TileNode::Split {
                 direction,
                 children,
@@ -551,44 +506,18 @@ impl TileNode {
             TileNode::Tabs { pages, active } => {
                 let snap_pages: Vec<crate::protocol::TabPageSnapshot> = pages
                     .iter()
-                    .map(|page| match &page.projection {
-                        Projection::Term(term) => {
-                            let (cols, rows, state, scrollback, alternate_screen) =
-                                term.state_snapshot();
-                            crate::protocol::TabPageSnapshot {
-                                id: page.id,
-                                name: term.title(),
-                                cols,
-                                rows,
-                                state,
-                                scrollback,
-                                alternate_screen,
-                                is_debug: false,
-                                is_debug_log: false,
-                            }
+                    .map(|page| {
+                        let (cols, rows, state, scrollback, alternate_screen) =
+                            page.projection.0.state_snapshot();
+                        crate::protocol::TabPageSnapshot {
+                            id: page.id,
+                            name: page.projection.0.title(),
+                            cols,
+                            rows,
+                            state,
+                            scrollback,
+                            alternate_screen,
                         }
-                        Projection::ServerDebug => crate::protocol::TabPageSnapshot {
-                            id: page.id,
-                            name: "Server Debug".to_string(),
-                            cols: 1,
-                            rows: 1,
-                            state: Vec::new(),
-                            scrollback: Vec::new(),
-                            alternate_screen: false,
-                            is_debug: true,
-                            is_debug_log: false,
-                        },
-                        Projection::DebugLog => crate::protocol::TabPageSnapshot {
-                            id: page.id,
-                            name: "Debug Log".to_string(),
-                            cols: 1,
-                            rows: 1,
-                            state: Vec::new(),
-                            scrollback: Vec::new(),
-                            alternate_screen: false,
-                            is_debug: false,
-                            is_debug_log: true,
-                        },
                     })
                     .collect();
                 if snap_pages.is_empty() {
@@ -940,7 +869,7 @@ impl Scope {
             let inner = pane_inner(*rect);
             let mut term = ProjectionTerm::with_command(inner.width, inner.height, &program, cwd)?;
             term.set_cell_size(cell_px.0, cell_px.1)?;
-            children.push((Constraint::Fill(1), Projection::Term(term)));
+            children.push((Constraint::Fill(1), Projection(term)));
         }
 
         let mut scope = Self::from_children(direction, children, area)?;
@@ -969,11 +898,6 @@ impl Scope {
         // The bytes are always ASCII (base64 payloads in APC escape codes).
         let passthrough = String::from_utf8_lossy(&passthrough).into_owned();
         let root = self.root.as_ref()?.to_snapshot()?;
-        let debug_log = if has_debug_log(&root) {
-            crate::debug::recent_debug_events()
-        } else {
-            Vec::new()
-        };
         Some(ScopeSnapshot {
             scope_id,
             scope_name,
@@ -981,7 +905,6 @@ impl Scope {
             focused_id: self.focused_id,
             root,
             passthrough,
-            debug_log,
         })
     }
 
@@ -1275,16 +1198,7 @@ impl Scope {
     }
 }
 
-pub fn has_debug_log(node: &SnapshotNode) -> bool {
-    match node {
-        SnapshotNode::DebugLog { .. } => true,
-        SnapshotNode::Leaf { .. } | SnapshotNode::Debug { .. } => false,
-        SnapshotNode::Split { children, .. } => children.iter().any(|c| has_debug_log(&c.node)),
-        SnapshotNode::Tabs { pages, .. } => pages.iter().any(|p| p.is_debug_log),
-    }
-}
-
-fn pane_inner(rect: Rect) -> Rect {
+pub fn pane_inner(rect: Rect) -> Rect {
     Block::bordered().inner(rect)
 }
 
@@ -1363,12 +1277,16 @@ fn find_neighbor(
 mod tests {
     use super::*;
 
+    fn dummy_projection() -> Projection {
+        Projection(ProjectionTerm::with_builtin(80, 24, "test", |_, _| {}).unwrap())
+    }
+
     #[test]
     fn stale_drop_preserves_projection_and_revision() {
         let mut scope = Scope::from_children(
             Direction::Horizontal,
             (0..2)
-                .map(|_| (Constraint::Fill(1), Projection::ServerDebug))
+                .map(|_| (Constraint::Fill(1), dummy_projection()))
                 .collect(),
             Rect::new(0, 0, 80, 24),
         )
@@ -1391,7 +1309,7 @@ mod tests {
         let mut scope = Scope::from_children(
             Direction::Horizontal,
             (0..3)
-                .map(|_| (Constraint::Fill(1), Projection::ServerDebug))
+                .map(|_| (Constraint::Fill(1), dummy_projection()))
                 .collect(),
             area,
         )

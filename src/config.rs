@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::protocol::{DEBUG_LOG_PROJECTION_PROGRAM, DEBUG_PROJECTION_PROGRAM};
+use crate::debug::builtins;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramOption {
@@ -25,13 +25,15 @@ impl ProgramOption {
 }
 
 pub fn default_programs() -> Vec<ProgramOption> {
-    vec![
+    let mut programs = vec![
         ProgramOption::new("ZSH", "zsh"),
         ProgramOption::new("Neovim", "nvim"),
         ProgramOption::new("lazygit", "lazygit"),
-        ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
-        ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
-    ]
+    ];
+    for builtin in builtins() {
+        programs.push(ProgramOption::new(builtin.label(), builtin.program()));
+    }
+    programs
 }
 
 pub fn default_harp_config_dir() -> Option<PathBuf> {
@@ -139,17 +141,13 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
         return default_programs();
     }
 
-    if !result
-        .iter()
-        .any(|program| program.program == DEBUG_PROJECTION_PROGRAM)
-    {
-        result.push(ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM));
-    }
-    if !result
-        .iter()
-        .any(|program| program.program == DEBUG_LOG_PROJECTION_PROGRAM)
-    {
-        result.push(ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM));
+    for builtin in builtins() {
+        if !result
+            .iter()
+            .any(|program| program.program == builtin.program())
+        {
+            result.push(ProgramOption::new(builtin.label(), builtin.program()));
+        }
     }
     result
 }
@@ -157,6 +155,7 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projections::ProjectionProgram;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -215,8 +214,8 @@ mod tests {
                 ProgramOption::new("Editor", "/home/aolse/.asdf/shims/nvim"),
                 ProgramOption::new("Shell", "bash"),
                 ProgramOption::new("Git", "lazygit"),
-                ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
-                ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
+                ProgramOption::new("Server Debug", crate::debug::ServerDebug.program()),
+                ProgramOption::new("Debug Log", crate::debug::DebugLog.program()),
             ]
         );
 
@@ -259,8 +258,8 @@ mod tests {
                 },
                 ProgramOption::new("Shell", "zsh"),
                 ProgramOption::new("Abs", "/usr/bin/env"),
-                ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
-                ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
+                ProgramOption::new("Server Debug", crate::debug::ServerDebug.program()),
+                ProgramOption::new("Debug Log", crate::debug::DebugLog.program()),
             ]
         );
 
