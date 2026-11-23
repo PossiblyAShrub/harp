@@ -418,7 +418,7 @@ impl App {
             }
             ServerMsg::PushSnapshot(_) | ServerMsg::PushScopeClosed(_) => {}
             ServerMsg::Unchanged => {}
-            ServerMsg::Ok => {}
+            ServerMsg::Ok | ServerMsg::Version { .. } => {}
             ServerMsg::ScopeClosed => {
                 self.cancel_drag();
                 self.snapshot = None;

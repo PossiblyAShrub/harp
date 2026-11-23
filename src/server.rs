@@ -221,7 +221,7 @@ impl ClientConnection {
             }
         });
 
-        Ok(Self {
+        let mut conn = Self {
             writer,
             rpc_rx,
             push_cb,
@@ -234,7 +234,47 @@ impl ClientConnection {
             _ssh_control_dir: ssh_control_dir,
             pending: VecDeque::new(),
             trace: VecDeque::new(),
-        })
+        };
+        conn.verify_version()?;
+        Ok(conn)
+    }
+
+    fn verify_version(&mut self) -> io::Result<()> {
+        self.writer.send(&ClientMsg::CheckVersion {
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?;
+        let reply = self.recv_rpc().map_err(|err| {
+            if err.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "server closed connection during version check (likely an outdated harp server; restart the harp server)",
+                )
+            } else {
+                err
+            }
+        })?;
+        match reply {
+            ServerMsg::Version { protocol, version } => {
+                if protocol != crate::protocol::PROTOCOL_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "server protocol version mismatch: client is v{} (protocol {}), server is v{version} (protocol {protocol}); restart the harp server",
+                            env!("CARGO_PKG_VERSION"),
+                            crate::protocol::PROTOCOL_VERSION,
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unexpected server version response (likely an outdated harp server; restart the harp server): {other:?}"
+                ),
+            )),
+        }
     }
 
     pub fn set_push_callback(&mut self, cb: Arc<dyn Fn(ServerMsg) + Send + Sync>) {
@@ -612,6 +652,10 @@ impl ServerState {
         self.prune_all();
 
         match msg {
+            ClientMsg::CheckVersion { .. } => ServerMsg::Version {
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
             ClientMsg::SetPixelSize { cell_w, cell_h } => {
                 self.cell_px = (cell_w, cell_h);
                 for s in &mut self.scopes {
@@ -1433,5 +1477,56 @@ mod tests {
 
         state.had_scopes = true;
         assert!(state.should_exit());
+    }
+
+    #[test]
+    fn connect_checks_server_protocol_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Matching version succeeds.
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut enc = EncryptedStream::handshake_server(stream).unwrap();
+            let msg: ClientMsg = enc.recv().unwrap();
+            assert!(matches!(msg, ClientMsg::CheckVersion { .. }));
+            enc.send(&ServerMsg::Version {
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+            .unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let conn = ClientConnection::from_stream(
+            EncryptedStream::handshake_client(stream).unwrap(),
+            None,
+            None,
+        );
+        assert!(conn.is_ok());
+        handle.join().unwrap();
+
+        // Mismatched version fails with a clear error.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut enc = EncryptedStream::handshake_server(stream).unwrap();
+            let _: ClientMsg = enc.recv().unwrap();
+            enc.send(&ServerMsg::Version {
+                protocol: crate::protocol::PROTOCOL_VERSION + 1,
+                version: "9.9.9".to_string(),
+            })
+            .unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let err = ClientConnection::from_stream(
+            EncryptedStream::handshake_client(stream).unwrap(),
+            None,
+            None,
+        )
+        .err()
+        .expect("mismatched protocol version should fail");
+        assert!(err.to_string().contains("protocol version mismatch"));
+        handle.join().unwrap();
     }
 }

@@ -645,11 +645,10 @@ impl PassthroughFilter {
             }
             FilterState::Osc { saw_esc } => match (saw_esc, b) {
                 (true, b'\\') => {
-                    screen.extend_from_slice(b"\x1b\\");
+                    screen.push(b'\\');
                     self.state = FilterState::Normal;
                 }
                 (true, _) => {
-                    screen.push(0x1b);
                     screen.push(b);
                     self.state = FilterState::Osc { saw_esc: false };
                 }
@@ -1549,6 +1548,12 @@ printf 'RESP:%s\n' "$r"
 
         parser.process(b"\x1b]2;vim main.rs\x1b\\");
         assert_eq!(parser.callbacks().title(), Some("vim main.rs"));
+
+        // Ensure PassthroughFilter preserves ST-terminated OSC sequences cleanly for vt100.
+        let (screen, _, _) = feed_split(&[b"\x1b]2;filtered-st\x1b\\"], (12, 24), (80, 24));
+        assert_eq!(screen, b"\x1b]2;filtered-st\x1b\\");
+        parser.process(&screen);
+        assert_eq!(parser.callbacks().title(), Some("filtered-st"));
 
         // Clearing window title falls back to icon_name if set, or None if cleared via OSC 0.
         parser.process(b"\x1b]0;\x07");

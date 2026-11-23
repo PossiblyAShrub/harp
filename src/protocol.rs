@@ -4,6 +4,7 @@ use crossterm::event::Event;
 use serde::{Deserialize, Serialize};
 
 pub const DEBUG_PROJECTION_PROGRAM: &str = "__harp_server_debug__";
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SplitDir {
@@ -137,6 +138,10 @@ pub struct ScopeSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
+    CheckVersion {
+        protocol: u32,
+        version: String,
+    },
     /// Reports the real terminal's character cell size in pixels so the server
     /// can report pixel sizes through TIOCGWINSZ and answer size queries.
     SetPixelSize {
@@ -242,6 +247,10 @@ pub enum ClientMsg {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Ok,
+    Version {
+        protocol: u32,
+        version: String,
+    },
     Scopes(Vec<ScopeInfo>),
     Hosts(Vec<HostInfo>),
     Snapshot(ScopeSnapshot),
