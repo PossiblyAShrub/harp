@@ -336,6 +336,7 @@ impl App {
         match node {
             SnapshotNode::Leaf {
                 id,
+                name: _,
                 cols,
                 rows,
                 state,
@@ -1814,6 +1815,7 @@ mod tests {
         assert!(slice_contains(state, b"\x1b_Gi=1;OK\x1b\\"), "ok not found");
         let root = SnapshotNode::Leaf {
             id: 1,
+            name: String::new(),
             cols: 10,
             rows: 10,
             state: state.to_vec(),

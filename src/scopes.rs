@@ -502,6 +502,7 @@ impl TileNode {
                     let (cols, rows, state, scrollback, alternate_screen) = term.state_snapshot();
                     Some(SnapshotNode::Leaf {
                         id: *id,
+                        name: term.title(),
                         cols,
                         rows,
                         state,

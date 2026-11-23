@@ -39,13 +39,12 @@ impl<'a> SnapshotView<'a> {
     fn render_node(&self, node: &SnapshotNode, area: Rect, buf: &mut Buffer) {
         let focused_id = self.snap.focused_id;
         match node {
-            SnapshotNode::Leaf { id, .. } => {
-                let border_style = if *id == focused_id {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let block = Block::bordered().border_style(border_style);
+            SnapshotNode::Leaf { id, name, .. } => {
+                let is_focused = *id == focused_id;
+                let mut block = Block::bordered().border_style(pane_border_style(is_focused));
+                if !name.is_empty() {
+                    block = block.title(pane_title_span(name, is_focused));
+                }
                 let inner = block.inner(area);
                 block.render(area, buf);
                 if let Some(parser) = self.parsers.get(id) {
@@ -66,14 +65,13 @@ impl<'a> SnapshotView<'a> {
             }
             SnapshotNode::Tabs { pages, active } => {
                 let is_focused = pages.get(*active).is_some_and(|p| p.id == focused_id);
-                let border_style = if is_focused {
-                    Style::default().fg(Color::White)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                let mut block = Block::bordered().border_style(border_style);
+                let mut block = Block::bordered().border_style(pane_border_style(is_focused));
                 if pages.len() > 1 {
                     block = block.title(render_tab_bar_line(pages, *active));
+                } else if let Some(page) = pages.first()
+                    && !page.name.is_empty()
+                {
+                    block = block.title(pane_title_span(&page.name, is_focused));
                 }
                 let inner = block.inner(area);
                 block.render(area, buf);
@@ -94,6 +92,25 @@ impl Widget for &SnapshotView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.render_node(&self.snap.root, area, buf);
     }
+}
+
+fn pane_border_style(is_focused: bool) -> Style {
+    if is_focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn pane_title_span(title: &str, is_focused: bool) -> Span<'_> {
+    let style = if is_focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Span::styled(format!(" {title} "), style)
 }
 
 fn split_layout(direction: SplitDir, children: &[SnapshotChild]) -> Layout {
@@ -262,6 +279,7 @@ mod tests {
     fn leaf(id: usize) -> SnapshotNode {
         SnapshotNode::Leaf {
             id,
+            name: String::new(),
             cols: 10,
             rows: 10,
             state: Vec::new(),
@@ -333,5 +351,34 @@ mod tests {
         };
         let area = Rect::new(0, 0, 100, 50);
         assert_eq!(pane_at(&root, area, 50, 25), Some(2));
+    }
+
+    #[test]
+    fn leaf_renders_title_on_top_border() {
+        let snap = ScopeSnapshot {
+            scope_id: 1,
+            scope_name: "test".into(),
+            revision: 1,
+            focused_id: 1,
+            root: SnapshotNode::Leaf {
+                id: 1,
+                name: "nvim src/main.rs".into(),
+                cols: 28,
+                rows: 8,
+                state: Vec::new(),
+                scrollback: Vec::new(),
+                alternate_screen: false,
+            },
+            passthrough: String::new(),
+        };
+        let parsers = HashMap::new();
+        let area = Rect::new(0, 0, 30, 10);
+        let mut buf = Buffer::empty(area);
+        SnapshotView::new(&snap, &parsers, &[]).render(area, &mut buf);
+        let top_row: String = (0..30).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top_row.contains(" nvim src/main.rs "),
+            "expected leaf title in top border, got: {top_row:?}"
+        );
     }
 }

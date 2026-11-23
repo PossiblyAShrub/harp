@@ -99,6 +99,8 @@ pub struct SnapshotChild {
 pub enum SnapshotNode {
     Leaf {
         id: usize,
+        #[serde(default)]
+        name: String,
         cols: u16,
         rows: u16,
         state: Vec<u8>,

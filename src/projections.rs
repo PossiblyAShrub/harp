@@ -157,11 +157,42 @@ impl Widget for &ProjectionStatus {
     }
 }
 
+#[derive(Default)]
+struct TitleCallbacks {
+    window_title: Option<String>,
+    icon_name: Option<String>,
+}
+
+impl TitleCallbacks {
+    fn title(&self) -> Option<&str> {
+        self.window_title.as_deref().or(self.icon_name.as_deref())
+    }
+}
+
+impl vt100::Callbacks for TitleCallbacks {
+    fn set_window_icon_name(&mut self, _: &mut vt100::Screen, icon_name: &[u8]) {
+        self.icon_name = sanitize_title(icon_name);
+    }
+
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.window_title = sanitize_title(title);
+    }
+}
+
+fn sanitize_title(bytes: &[u8]) -> Option<String> {
+    let cleaned: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 pub struct ProjectionTerm {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<TitleCallbacks>>>,
     exited: Arc<AtomicBool>,
     revision: Arc<AtomicU64>,
     size: (u16, u16),
@@ -216,7 +247,12 @@ impl ProjectionTerm {
         let mut child = pty.slave.spawn_command(cmd)?;
         let killer = child.clone_killer();
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            SCROLLBACK_LINES,
+            TitleCallbacks::default(),
+        )));
         let exited = Arc::new(AtomicBool::new(false));
         let revision = Arc::new(AtomicU64::new(1));
 
@@ -302,6 +338,9 @@ impl ProjectionTerm {
     }
 
     pub fn title(&self) -> String {
+        if let Some(title) = self.parser.lock().unwrap().callbacks().title() {
+            return title.to_string();
+        }
         Path::new(&self.program)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -720,7 +759,7 @@ fn answer_graphics_query(apc: &[u8]) -> Option<Vec<u8>> {
 /// Scrollback offset 0 shows the bottom of the screen; `total` is the number
 /// of scrolled-out rows. The walk starts at the top (offset `total`) and works
 /// down, taking only the history portion of each window.
-fn serialize_history(parser: &mut vt100::Parser) -> Vec<u8> {
+fn serialize_history<CB: vt100::Callbacks>(parser: &mut vt100::Parser<CB>) -> Vec<u8> {
     let screen = parser.screen_mut();
     screen.set_scrollback(usize::MAX);
     let total = screen.scrollback();
@@ -1495,6 +1534,51 @@ printf 'RESP:%s\n' "$r"
             contents.contains("RESP:"),
             "child should have received the size answer, got: {contents:?}"
         );
+
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    #[test]
+    fn title_callbacks_track_osc_titles_and_clear_on_empty() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, TitleCallbacks::default());
+        assert_eq!(parser.callbacks().title(), None);
+
+        parser.process(b"\x1b]0;build: app\x07");
+        assert_eq!(parser.callbacks().title(), Some("build: app"));
+
+        parser.process(b"\x1b]2;vim main.rs\x1b\\");
+        assert_eq!(parser.callbacks().title(), Some("vim main.rs"));
+
+        // Clearing window title falls back to icon_name if set, or None if cleared via OSC 0.
+        parser.process(b"\x1b]0;\x07");
+        assert_eq!(parser.callbacks().title(), None);
+
+        // OSC 1 alone sets icon_name as fallback when window_title is unset.
+        parser.process(b"\x1b]1;short\x07");
+        assert_eq!(parser.callbacks().title(), Some("short"));
+
+        // Control characters are stripped and whitespace-only titles are ignored.
+        parser.process(b"\x1b]2;  hello\nworld  \x07");
+        assert_eq!(parser.callbacks().title(), Some("helloworld"));
+        parser.process(b"\x1b]0;   \x07");
+        assert_eq!(parser.callbacks().title(), None);
+    }
+
+    #[test]
+    fn term_updates_title_from_osc_sequence() {
+        let cwd = std::env::temp_dir();
+        let script_path = cwd.join("harp_title_test.sh");
+        let script = "#!/bin/bash\nprintf '\\033]2;custom-pane-title\\007'\nsleep 0.2\n";
+        std::fs::write(&script_path, script).unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+        let program = script_path.display().to_string();
+
+        let term = ProjectionTerm::with_command(80, 24, &program, &cwd).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(term.title(), "custom-pane-title");
 
         let _ = std::fs::remove_file(&script_path);
     }
