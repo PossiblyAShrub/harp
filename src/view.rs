@@ -10,7 +10,7 @@ use ratatui::{
 use tui_term::{vt100, widget::PseudoTerminal};
 
 use crate::{
-    debug::ServerDebugProjection,
+    debug::{DebugLogProjection, ServerDebugProjection},
     protocol::{ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir, TabPageSnapshot},
     server::ServerTraceEntry,
 };
@@ -54,6 +54,9 @@ impl<'a> SnapshotView<'a> {
             SnapshotNode::Debug { .. } => {
                 ServerDebugProjection::new(self.trace).render(area, buf);
             }
+            SnapshotNode::DebugLog { .. } => {
+                DebugLogProjection::new(&self.snap.debug_log).render(area, buf);
+            }
             SnapshotNode::Split {
                 direction,
                 children,
@@ -79,6 +82,8 @@ impl<'a> SnapshotView<'a> {
                 if let Some(page) = pages.get(*active) {
                     if page.is_debug {
                         ServerDebugProjection::new(self.trace).render(inner, buf);
+                    } else if page.is_debug_log {
+                        DebugLogProjection::new(&self.snap.debug_log).render(inner, buf);
                     } else if let Some(parser) = self.parsers.get(&page.id) {
                         PseudoTerminal::new(parser.screen()).render(inner, buf);
                     }
@@ -150,7 +155,9 @@ fn find_pane<T>(
 
 fn active_id(node: &SnapshotNode) -> Option<usize> {
     match node {
-        SnapshotNode::Leaf { id, .. } | SnapshotNode::Debug { id } => Some(*id),
+        SnapshotNode::Leaf { id, .. }
+        | SnapshotNode::Debug { id }
+        | SnapshotNode::DebugLog { id } => Some(*id),
         SnapshotNode::Tabs { pages, active } => pages.get(*active).map(|page| page.id),
         SnapshotNode::Split { .. } => None,
     }
@@ -335,6 +342,7 @@ mod tests {
                     scrollback: Vec::new(),
                     alternate_screen: false,
                     is_debug: false,
+                    is_debug_log: false,
                 },
                 TabPageSnapshot {
                     id: 2,
@@ -345,6 +353,7 @@ mod tests {
                     scrollback: Vec::new(),
                     alternate_screen: false,
                     is_debug: false,
+                    is_debug_log: false,
                 },
             ],
             active: 1,
@@ -370,6 +379,7 @@ mod tests {
                 alternate_screen: false,
             },
             passthrough: String::new(),
+            debug_log: Vec::new(),
         };
         let parsers = HashMap::new();
         let area = Rect::new(0, 0, 30, 10);

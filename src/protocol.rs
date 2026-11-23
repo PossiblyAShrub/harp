@@ -4,7 +4,8 @@ use crossterm::event::Event;
 use serde::{Deserialize, Serialize};
 
 pub const DEBUG_PROJECTION_PROGRAM: &str = "__harp_server_debug__";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const DEBUG_LOG_PROJECTION_PROGRAM: &str = "__harp_debug_log__";
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SplitDir {
@@ -88,6 +89,8 @@ pub struct TabPageSnapshot {
     pub alternate_screen: bool,
     #[serde(default)]
     pub is_debug: bool,
+    #[serde(default)]
+    pub is_debug_log: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,6 +115,9 @@ pub enum SnapshotNode {
     Debug {
         id: usize,
     },
+    DebugLog {
+        id: usize,
+    },
     Split {
         direction: SplitDir,
         children: Vec<SnapshotChild>,
@@ -134,6 +140,8 @@ pub struct ScopeSnapshot {
     /// Always ASCII (base64 payloads), so a `String` keeps the JSON framing
     /// compact instead of one array entry per byte.
     pub passthrough: String,
+    #[serde(default)]
+    pub debug_log: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

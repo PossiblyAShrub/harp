@@ -171,10 +171,14 @@ impl TitleCallbacks {
 
 impl vt100::Callbacks for TitleCallbacks {
     fn set_window_icon_name(&mut self, _: &mut vt100::Screen, icon_name: &[u8]) {
+        let raw = String::from_utf8_lossy(icon_name);
+        crate::debug::log_debug_event(format!("title received (OSC 1 icon): {raw:?}"));
         self.icon_name = sanitize_title(icon_name);
     }
 
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        let raw = String::from_utf8_lossy(title);
+        crate::debug::log_debug_event(format!("title received (OSC 0/2): {raw:?}"));
         self.window_title = sanitize_title(title);
     }
 }
@@ -245,6 +249,7 @@ impl ProjectionTerm {
             cmd.env("TERM", "xterm-256color");
         }
         let mut child = pty.slave.spawn_command(cmd)?;
+        crate::debug::log_debug_event(format!("started projection: {program}"));
         let killer = child.clone_killer();
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(

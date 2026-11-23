@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::protocol::DEBUG_PROJECTION_PROGRAM;
+use crate::protocol::{DEBUG_LOG_PROJECTION_PROGRAM, DEBUG_PROJECTION_PROGRAM};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramOption {
@@ -30,6 +30,7 @@ pub fn default_programs() -> Vec<ProgramOption> {
         ProgramOption::new("Neovim", "nvim"),
         ProgramOption::new("lazygit", "lazygit"),
         ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
+        ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
     ]
 }
 
@@ -144,6 +145,12 @@ pub fn load_programs(cwd: &Path, config_dir: Option<&Path>) -> Vec<ProgramOption
     {
         result.push(ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM));
     }
+    if !result
+        .iter()
+        .any(|program| program.program == DEBUG_LOG_PROJECTION_PROGRAM)
+    {
+        result.push(ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM));
+    }
     result
 }
 
@@ -209,6 +216,7 @@ mod tests {
                 ProgramOption::new("Shell", "bash"),
                 ProgramOption::new("Git", "lazygit"),
                 ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
+                ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
             ]
         );
 
@@ -252,6 +260,7 @@ mod tests {
                 ProgramOption::new("Shell", "zsh"),
                 ProgramOption::new("Abs", "/usr/bin/env"),
                 ProgramOption::new("Server Debug", DEBUG_PROJECTION_PROGRAM),
+                ProgramOption::new("Debug Log", DEBUG_LOG_PROJECTION_PROGRAM),
             ]
         );
 

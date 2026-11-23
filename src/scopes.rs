@@ -13,7 +13,8 @@ use ratatui::{
 use crate::{
     projections::ProjectionTerm,
     protocol::{
-        DEBUG_PROJECTION_PROGRAM, DropAction, ScopeSnapshot, SnapshotChild, SnapshotNode, SplitDir,
+        DEBUG_LOG_PROJECTION_PROGRAM, DEBUG_PROJECTION_PROGRAM, DropAction, ScopeSnapshot,
+        SnapshotChild, SnapshotNode, SplitDir,
     },
 };
 
@@ -58,12 +59,16 @@ impl NavDirection {
 pub enum Projection {
     Term(ProjectionTerm),
     ServerDebug,
+    DebugLog,
 }
 
 impl Projection {
     fn from_spec(spec: &ScopeSpec, cols: u16, rows: u16, cell_px: (u16, u16)) -> Result<Self> {
         if spec.program == DEBUG_PROJECTION_PROGRAM {
             return Ok(Projection::ServerDebug);
+        }
+        if spec.program == DEBUG_LOG_PROJECTION_PROGRAM {
+            return Ok(Projection::DebugLog);
         }
         let mut term = ProjectionTerm::with_command(cols, rows, &spec.program, &spec.cwd)?;
         term.set_cell_size(cell_px.0, cell_px.1)?;
@@ -73,7 +78,7 @@ impl Projection {
     fn is_exited(&self) -> bool {
         match self {
             Projection::Term(term) => term.is_exited(),
-            Projection::ServerDebug => false,
+            Projection::ServerDebug | Projection::DebugLog => false,
         }
     }
 
@@ -84,14 +89,14 @@ impl Projection {
     fn set_cell_pixels(&mut self, w: u16, h: u16) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.set_cell_size(w, h),
-            Projection::ServerDebug => Ok(()),
+            Projection::ServerDebug | Projection::DebugLog => Ok(()),
         }
     }
 
     fn take_passthrough(&mut self) -> Vec<u8> {
         match self {
             Projection::Term(term) => term.take_passthrough(),
-            Projection::ServerDebug => Vec::new(),
+            Projection::ServerDebug | Projection::DebugLog => Vec::new(),
         }
     }
 
@@ -101,28 +106,28 @@ impl Projection {
                 let inner = pane_inner(rect);
                 term.resize(inner.width, inner.height)
             }
-            Projection::ServerDebug => Ok(()),
+            Projection::ServerDebug | Projection::DebugLog => Ok(()),
         }
     }
 
     fn handle_event(&mut self, event: &Event) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_event(event),
-            Projection::ServerDebug => Ok(()),
+            Projection::ServerDebug | Projection::DebugLog => Ok(()),
         }
     }
 
     fn handle_mouse_event(&mut self, mouse_event: MouseEvent) -> io::Result<()> {
         match self {
             Projection::Term(term) => term.handle_mouse_event(mouse_event),
-            Projection::ServerDebug => Ok(()),
+            Projection::ServerDebug | Projection::DebugLog => Ok(()),
         }
     }
 
     fn prune_exited(&mut self) -> io::Result<bool> {
         match self {
             Projection::Term(_) => Ok(false),
-            Projection::ServerDebug => Ok(false),
+            Projection::ServerDebug | Projection::DebugLog => Ok(false),
         }
     }
 
@@ -130,6 +135,7 @@ impl Projection {
         match self {
             Projection::Term(term) => term.revision(),
             Projection::ServerDebug => 0,
+            Projection::DebugLog => crate::debug::debug_log_revision(),
         }
     }
 
@@ -511,6 +517,7 @@ impl TileNode {
                     })
                 }
                 Projection::ServerDebug => Some(SnapshotNode::Debug { id: *id }),
+                Projection::DebugLog => Some(SnapshotNode::DebugLog { id: *id }),
             },
             TileNode::Split {
                 direction,
@@ -557,6 +564,7 @@ impl TileNode {
                                 scrollback,
                                 alternate_screen,
                                 is_debug: false,
+                                is_debug_log: false,
                             }
                         }
                         Projection::ServerDebug => crate::protocol::TabPageSnapshot {
@@ -568,6 +576,18 @@ impl TileNode {
                             scrollback: Vec::new(),
                             alternate_screen: false,
                             is_debug: true,
+                            is_debug_log: false,
+                        },
+                        Projection::DebugLog => crate::protocol::TabPageSnapshot {
+                            id: page.id,
+                            name: "Debug Log".to_string(),
+                            cols: 1,
+                            rows: 1,
+                            state: Vec::new(),
+                            scrollback: Vec::new(),
+                            alternate_screen: false,
+                            is_debug: false,
+                            is_debug_log: true,
                         },
                     })
                     .collect();
@@ -949,6 +969,11 @@ impl Scope {
         // The bytes are always ASCII (base64 payloads in APC escape codes).
         let passthrough = String::from_utf8_lossy(&passthrough).into_owned();
         let root = self.root.as_ref()?.to_snapshot()?;
+        let debug_log = if has_debug_log(&root) {
+            crate::debug::recent_debug_events()
+        } else {
+            Vec::new()
+        };
         Some(ScopeSnapshot {
             scope_id,
             scope_name,
@@ -956,6 +981,7 @@ impl Scope {
             focused_id: self.focused_id,
             root,
             passthrough,
+            debug_log,
         })
     }
 
@@ -1249,7 +1275,16 @@ impl Scope {
     }
 }
 
-pub fn pane_inner(rect: Rect) -> Rect {
+pub fn has_debug_log(node: &SnapshotNode) -> bool {
+    match node {
+        SnapshotNode::DebugLog { .. } => true,
+        SnapshotNode::Leaf { .. } | SnapshotNode::Debug { .. } => false,
+        SnapshotNode::Split { children, .. } => children.iter().any(|c| has_debug_log(&c.node)),
+        SnapshotNode::Tabs { pages, .. } => pages.iter().any(|p| p.is_debug_log),
+    }
+}
+
+fn pane_inner(rect: Rect) -> Rect {
     Block::bordered().inner(rect)
 }
 
