@@ -619,6 +619,13 @@ struct PassthroughFilter {
     utf8_buf: [u8; 4],
     utf8_len: u8,
     utf8_expected: u8,
+    /// Tracked 0-based cursor column (`col == cols` represents pending wrap at
+    /// the right margin). Used to clear `vt100`'s pending wrap before cursor
+    /// moves (`CUU`/`CUD`/`CUB`/`VPA`/`BS`) that `vt100` otherwise leaves at
+    /// `pos.col == cols`.
+    col: u16,
+    saved_col: u16,
+    last_cols: u16,
 }
 
 enum FilterState {
@@ -653,6 +660,9 @@ impl PassthroughFilter {
             utf8_buf: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
+            col: 0,
+            saved_col: 0,
+            last_cols: 0,
         }
     }
 
@@ -660,10 +670,100 @@ impl PassthroughFilter {
         self.in_sync_update
     }
 
-    fn record_normal_byte(&mut self, b: u8) {
+    /// Advances the tracked column after printing a glyph of `width` cells.
+    /// When already at `cols` (pending wrap), the glyph wraps to column 0 of
+    /// the next row first, landing at `width`.
+    fn advance_col(&mut self, width: u16, cols: u16) {
+        if cols == 0 || width == 0 {
+            return;
+        }
+        if self.col >= cols {
+            self.col = width.min(cols);
+        } else {
+            self.col = self.col.saturating_add(width).min(cols);
+        }
+    }
+
+    /// `vt100` encodes pending wrap as `pos.col == cols` and does not clear it
+    /// on `CUU`/`CUD`/`CUB`/`VPA`/`BS`, causing `CUB`/`BS` to be off by 1 and
+    /// subsequent text after `CUU`/`CUD`/`VPA` to wrap onto the wrong row.
+    /// Emitting `CHA cols` (`CSI cols G`) clamps `pos.col` back to `cols - 1`
+    /// without changing the row.
+    fn clear_pending_wrap(&mut self, cols: u16, screen: &mut Vec<u8>) {
+        if cols > 0 && self.col >= cols {
+            screen.extend_from_slice(format!("\x1b[{cols}G").as_bytes());
+            self.col = cols - 1;
+        }
+    }
+
+    /// Mirrors CSI horizontal cursor effects so `self.col` stays aligned with
+    /// `vt100` across mid-chunk movements, tabs, REP, and alt-screen switches.
+    fn update_col_for_csi(&mut self, params: &[u8], final_byte: u8, cols: u16) {
+        if cols == 0 {
+            return;
+        }
+        let max_col = cols.saturating_sub(1);
+        match final_byte {
+            b'G' | b'`' => {
+                let c = parse_csi_u16(params).unwrap_or(1).max(1);
+                self.col = c.saturating_sub(1).min(max_col);
+            }
+            b'H' | b'f' => {
+                let c = params
+                    .split(|&b| b == b';')
+                    .nth(1)
+                    .and_then(parse_csi_u16)
+                    .unwrap_or(1)
+                    .max(1);
+                self.col = c.saturating_sub(1).min(max_col);
+            }
+            b'C' => {
+                let n = parse_csi_u16(params).unwrap_or(1).max(1);
+                self.col = self.col.saturating_add(n).min(max_col);
+            }
+            b'D' => {
+                let n = parse_csi_u16(params).unwrap_or(1).max(1);
+                self.col = self.col.saturating_sub(n);
+            }
+            b'E' | b'F' => self.col = 0,
+            b'I' => {
+                let count = parse_csi_u16(params).unwrap_or(1).clamp(1, 256);
+                for _ in 0..count {
+                    self.col = ((self.col / 8) + 1).saturating_mul(8).min(max_col);
+                }
+            }
+            b'b' if self.last_char.is_some() => {
+                let cap = usize::from(cols).clamp(256, 4096);
+                let count = (parse_csi_u16(params).unwrap_or(1).max(1) as usize).min(cap);
+                for _ in 0..count {
+                    self.advance_col(1, cols);
+                }
+            }
+            b'h' if params == b"?1049" => {
+                self.saved_col = self.col;
+                self.col = 0;
+            }
+            b'l' if params == b"?1049" => {
+                self.col = self.saved_col.min(cols);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_normal_byte(&mut self, b: u8, cols: u16) {
         if b < 0x20 || b == 0x7f {
             self.utf8_len = 0;
             self.utf8_expected = 0;
+            match b {
+                b'\r' => self.col = 0,
+                b'\t' if cols > 0 => {
+                    self.col = ((self.col / 8) + 1)
+                        .saturating_mul(8)
+                        .min(cols.saturating_sub(1));
+                }
+                0x08 => self.col = self.col.saturating_sub(1),
+                _ => {}
+            }
             return;
         }
         if b < 0x80 {
@@ -671,6 +771,7 @@ impl PassthroughFilter {
             self.last_char_len = 1;
             self.utf8_len = 0;
             self.utf8_expected = 0;
+            self.advance_col(1, cols);
             return;
         }
         if b >= 0xc2 {
@@ -693,6 +794,7 @@ impl PassthroughFilter {
                     self.last_char_len = self.utf8_len;
                     self.utf8_len = 0;
                     self.utf8_expected = 0;
+                    self.advance_col(1, cols);
                 }
             }
         } else {
@@ -715,6 +817,10 @@ impl PassthroughFilter {
         size: (u16, u16),
         cursor: (u16, u16),
     ) {
+        if size.1 != self.last_cols {
+            self.last_cols = size.1;
+            self.col = self.col.min(size.1);
+        }
         for &b in bytes {
             self.feed_byte(b, screen, passthrough, responses, cell_px, size, cursor);
         }
@@ -738,7 +844,10 @@ impl PassthroughFilter {
                     self.utf8_expected = 0;
                     self.state = FilterState::Esc;
                 } else {
-                    self.record_normal_byte(b);
+                    if b == 0x08 {
+                        self.clear_pending_wrap(size.1, screen);
+                    }
+                    self.record_normal_byte(b, size.1);
                     screen.push(b);
                     self.state = FilterState::Normal;
                 }
@@ -781,6 +890,17 @@ impl PassthroughFilter {
                     ) {
                         responses.extend_from_slice(&response);
                     } else {
+                        let cols = size.1;
+                        // Cursor-movement sequences clear pending wrap in
+                        // standard terminals, whereas `vt100` leaves
+                        // `pos.col == cols`. Erase sequences (`ED`/`EL`/`ECH`)
+                        // are intentionally excluded because they do not clear
+                        // pending wrap in standard terminals.
+                        let clears_pending_wrap = matches!(b, b'A' | b'B' | b'D' | b'd');
+                        if clears_pending_wrap {
+                            self.clear_pending_wrap(cols, screen);
+                        }
+                        self.update_col_for_csi(&params, b, cols);
                         emit_translated_csi(
                             &params,
                             b,
