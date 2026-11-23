@@ -390,12 +390,12 @@ impl Term {
         })
     }
 
-    /// Detach cleanly from Harp (Ctrl+Space -> Managing mode, then `q`), falling
+    /// Detach cleanly from Harp (Ctrl+Space -> Managing mode, then `d`), falling
     /// back to killing the client process.
     pub fn detach_harp(&mut self) {
         self.send("\x00");
         thread::sleep(Duration::from_millis(50));
-        self.send("q");
+        self.send("d");
         let start = Instant::now();
         while !self.closed.load(Ordering::Acquire) && start.elapsed() < Duration::from_secs(2) {
             thread::sleep(Duration::from_millis(20));

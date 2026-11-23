@@ -78,7 +78,7 @@ struct App {
     scroll: HashMap<usize, usize>,
     /// Previous local left click, used to recognize a double-click.
     last_click: Option<(Instant, usize, u16, u16)>,
-    pending_q: Option<(Instant, Mode)>,
+    pending_q: Option<Instant>,
     exit: bool,
 }
 
@@ -224,6 +224,9 @@ impl App {
 
     fn set_mode(&mut self, mode: Mode) {
         self.cancel_drag();
+        if mode != Mode::Managing {
+            self.flush_pending_q();
+        }
         self.mode = mode;
         self.status.set_mode(mode);
     }
@@ -826,7 +829,7 @@ impl App {
 
         while !self.exit {
             self.process_background()?;
-            self.flush_expired_q()?;
+            self.flush_expired_q();
             if self.exit {
                 break;
             }
@@ -884,20 +887,19 @@ impl App {
             if key.code == KeyCode::Char('q')
                 && key.modifiers == KeyModifiers::NONE
                 && key.kind == KeyEventKind::Release);
-        let can_close = self.snapshot.is_some()
+        let can_close = self.mode == Mode::Managing
+            && self.snapshot.is_some()
             && self.picker.is_none()
             && self.switcher.is_none()
             && self.rename.is_none()
             && self.copy_mode.is_none();
 
         if !can_close {
-            if self.pending_q.is_some() {
-                self.flush_pending_q()?;
-            }
+            self.flush_pending_q();
             return Ok(false);
         }
 
-        if let Some((started, _)) = self.pending_q {
+        if let Some(started) = self.pending_q {
             if is_q_repeat || is_q_release {
                 return Ok(true);
             }
@@ -916,44 +918,31 @@ impl App {
                 }
                 return Ok(true);
             }
-            self.flush_pending_q()?;
+            self.flush_pending_q();
         }
 
         if is_q_press {
-            self.pending_q = Some((Instant::now(), self.mode));
-            let prompt = if self.mode == Mode::Managing {
-                "Press q again to close projection, or wait to detach".to_string()
-            } else {
-                "Press q again within 400 ms to close projection".to_string()
-            };
-            self.status.set_error(Some(prompt));
+            self.pending_q = Some(Instant::now());
+            self.status
+                .set_error(Some("Press q again to close projection".to_string()));
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn flush_pending_q(&mut self) -> io::Result<()> {
-        let Some((_, mode)) = self.pending_q.take() else {
-            return Ok(());
-        };
-        self.status.set_error(None);
-        match mode {
-            Mode::Managing => self.exit = true,
-            Mode::Interacting => self.forward_event(Event::Key(
-                crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            ))?,
+    fn flush_pending_q(&mut self) {
+        if self.pending_q.take().is_some() {
+            self.status.set_error(None);
         }
-        Ok(())
     }
 
-    fn flush_expired_q(&mut self) -> io::Result<()> {
+    fn flush_expired_q(&mut self) {
         if self
             .pending_q
-            .is_some_and(|(started, _)| started.elapsed() >= Duration::from_millis(400))
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(400))
         {
-            self.flush_pending_q()?;
+            self.flush_pending_q();
         }
-        Ok(())
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -1368,7 +1357,7 @@ impl App {
                                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                             {
                                 self.set_mode(Mode::Interacting);
-                            } else if key_event.code == KeyCode::Char('q')
+                            } else if key_event.code == KeyCode::Char('d')
                                 && key_event.modifiers == KeyModifiers::NONE
                             {
                                 self.exit = true;
