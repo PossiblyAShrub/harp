@@ -150,14 +150,17 @@ pub fn run_askpass_helper(config: &AskpassConfig, prompt: &str) -> Result<()> {
     Ok(())
 }
 
+type PushCallback = Arc<dyn Fn(ServerMsg) + Send + Sync>;
+type PushCallbackSlot = Arc<Mutex<Option<(u64, PushCallback)>>>;
+
 /// A client connection and, for SSH connections, the tunnel that carries it.
 /// Keeping the child here makes the forwarding process live exactly as long as
 /// the client session.
 pub struct ClientConnection {
     writer: EncryptedWriter,
     rpc_rx: Receiver<io::Result<ServerMsg>>,
-    push_cb: Arc<Mutex<Option<(u64, Arc<dyn Fn(ServerMsg) + Send + Sync>)>>>,
-    push_cb_root: Option<Arc<dyn Fn(ServerMsg) + Send + Sync>>,
+    push_cb: PushCallbackSlot,
+    push_cb_root: Option<PushCallback>,
     peers: Vec<(HostInfo, Box<ClientConnection>)>,
     pending_peer: Option<usize>,
     aggregating_scopes: bool,
@@ -174,8 +177,7 @@ impl ClientConnection {
     ) -> io::Result<Self> {
         let (mut reader, writer) = stream.split()?;
         let (rpc_tx, rpc_rx) = mpsc::channel();
-        let push_cb: Arc<Mutex<Option<(u64, Arc<dyn Fn(ServerMsg) + Send + Sync>)>>> =
-            Arc::new(Mutex::new(None));
+        let push_cb: PushCallbackSlot = Arc::new(Mutex::new(None));
         let push_cb_bg = Arc::clone(&push_cb);
 
         thread::spawn(move || {

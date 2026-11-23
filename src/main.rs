@@ -785,14 +785,13 @@ impl App {
                     self.apply_snapshot(snap);
                 }
             }
-            ServerMsg::PushScopeClosed(scope_id) => {
+            ServerMsg::PushScopeClosed(scope_id)
                 if self
                     .snapshot
                     .as_ref()
-                    .is_some_and(|cur| cur.scope_id == scope_id)
-                {
-                    self.handle_server_reply(ServerMsg::ScopeClosed)?;
-                }
+                    .is_some_and(|cur| cur.scope_id == scope_id) =>
+            {
+                self.handle_server_reply(ServerMsg::ScopeClosed)?;
             }
             _ => {}
         }

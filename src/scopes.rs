@@ -538,11 +538,13 @@ impl TileNode {
         target_id: usize,
         dir: NavDirection,
         new_id: usize,
-        new_projection: Projection,
-    ) -> Result<(), Projection> {
+        new_projection: &mut Option<Projection>,
+    ) -> bool {
         match self {
             TileNode::Leaf { id, .. } => {
-                if *id == target_id {
+                if *id == target_id
+                    && let Some(proj) = new_projection.take()
+                {
                     let existing = std::mem::replace(
                         self,
                         TileNode::Split {
@@ -552,12 +554,12 @@ impl TileNode {
                     );
                     let new_leaf = TileNode::Leaf {
                         id: new_id,
-                        projection: new_projection,
+                        projection: proj,
                     };
                     *self = Self::split_pair(existing, new_leaf, dir);
-                    Ok(())
+                    true
                 } else {
-                    Err(new_projection)
+                    false
                 }
             }
             TileNode::Split {
@@ -568,6 +570,7 @@ impl TileNode {
                     && let Some(pos) = children.iter().position(
                         |c| matches!(c.node, TileNode::Leaf { id, .. } if id == target_id),
                     )
+                    && let Some(proj) = new_projection.take()
                 {
                     let insert_idx = if dir.insert_before() { pos } else { pos + 1 };
                     children.insert(
@@ -576,26 +579,21 @@ impl TileNode {
                             constraint: Constraint::Fill(1),
                             node: TileNode::Leaf {
                                 id: new_id,
-                                projection: new_projection,
+                                projection: proj,
                             },
                         },
                     );
-                    return Ok(());
+                    return true;
                 }
 
-                let mut pending = Some(new_projection);
-                for child in children.iter_mut() {
-                    if let Some(proj) = pending.take() {
-                        match child.node.split_leaf(target_id, dir, new_id, proj) {
-                            Ok(()) => return Ok(()),
-                            Err(returned) => pending = Some(returned),
-                        }
-                    }
-                }
-                Err(pending.unwrap())
+                children
+                    .iter_mut()
+                    .any(|child| child.node.split_leaf(target_id, dir, new_id, new_projection))
             }
             TileNode::Tabs { pages, .. } => {
-                if pages.iter().any(|p| p.id == target_id) {
+                if pages.iter().any(|p| p.id == target_id)
+                    && let Some(proj) = new_projection.take()
+                {
                     let existing = std::mem::replace(
                         self,
                         TileNode::Split {
@@ -605,12 +603,12 @@ impl TileNode {
                     );
                     let new_leaf = TileNode::Leaf {
                         id: new_id,
-                        projection: new_projection,
+                        projection: proj,
                     };
                     *self = Self::split_pair(existing, new_leaf, dir);
-                    Ok(())
+                    true
                 } else {
-                    Err(new_projection)
+                    false
                 }
             }
         }
@@ -620,11 +618,13 @@ impl TileNode {
         &mut self,
         target_id: usize,
         new_id: usize,
-        new_projection: Projection,
-    ) -> Result<(), Projection> {
+        new_projection: &mut Option<Projection>,
+    ) -> bool {
         match self {
             TileNode::Leaf { id, .. } => {
-                if *id == target_id {
+                if *id == target_id
+                    && let Some(proj) = new_projection.take()
+                {
                     let existing = std::mem::replace(
                         self,
                         TileNode::Tabs {
@@ -641,38 +641,31 @@ impl TileNode {
                             existing_leaf,
                             TabPage {
                                 id: new_id,
-                                projection: new_projection,
+                                projection: proj,
                             },
                         ],
                         active: 1,
                     };
-                    Ok(())
+                    true
                 } else {
-                    Err(new_projection)
+                    false
                 }
             }
-            TileNode::Split { children, .. } => {
-                let mut pending = Some(new_projection);
-                for child in children.iter_mut() {
-                    if let Some(proj) = pending.take() {
-                        match child.node.new_tab(target_id, new_id, proj) {
-                            Ok(()) => return Ok(()),
-                            Err(returned) => pending = Some(returned),
-                        }
-                    }
-                }
-                Err(pending.unwrap())
-            }
+            TileNode::Split { children, .. } => children
+                .iter_mut()
+                .any(|child| child.node.new_tab(target_id, new_id, new_projection)),
             TileNode::Tabs { pages, active } => {
-                if pages.iter().any(|p| p.id == target_id) {
+                if pages.iter().any(|p| p.id == target_id)
+                    && let Some(proj) = new_projection.take()
+                {
                     pages.push(TabPage {
                         id: new_id,
-                        projection: new_projection,
+                        projection: proj,
                     });
                     *active = pages.len() - 1;
-                    Ok(())
+                    true
                 } else {
-                    Err(new_projection)
+                    false
                 }
             }
         }
@@ -1086,11 +1079,8 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder = Projection::from_spec(spec, 1, 1, self.cell_px)?;
-        if root
-            .split_leaf(self.focused_id, dir, new_id, placeholder)
-            .is_ok()
-        {
+        let mut placeholder = Some(Projection::from_spec(spec, 1, 1, self.cell_px)?);
+        if root.split_leaf(self.focused_id, dir, new_id, &mut placeholder) {
             self.focused_id = new_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);
             self.resize(self.area)?;
@@ -1112,8 +1102,8 @@ impl Scope {
         let new_id = self.next_id;
         self.next_id += 1;
 
-        let placeholder = Projection::from_spec(spec, 1, 1, self.cell_px)?;
-        if root.new_tab(self.focused_id, new_id, placeholder).is_ok() {
+        let mut placeholder = Some(Projection::from_spec(spec, 1, 1, self.cell_px)?);
+        if root.new_tab(self.focused_id, new_id, &mut placeholder) {
             self.focused_id = new_id;
             self.layout_revision = self.layout_revision.wrapping_add(1);
             self.resize(self.area)?;
